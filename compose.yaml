@@ -12,6 +12,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+    restart: unless-stopped
 
   app:
     build:
@@ -36,11 +37,13 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/readyz').then(response => response.text()).then(body => { if (!body.includes('ready')) process.exit(1) }).catch(() => process.exit(1))"]
       interval: 5s
       timeout: 3s
       retries: 20
+      start_period: 10s
 
 volumes:
   xiexu_pgdata:

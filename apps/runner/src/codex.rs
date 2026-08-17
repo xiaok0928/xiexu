@@ -146,6 +146,7 @@ impl CodexConfig {
 
     /// 创建并校验项目工作区，防止符号链接或异常 ID 逃逸允许根目录。
     async fn prepare_workspace(&self, project_id: &str) -> Result<PathBuf, String> {
+        // 项目主键必须是 UUID，避免路径分隔符、上级目录和平台特殊路径进入拼接阶段。
         Uuid::parse_str(project_id).map_err(|_| "project_id must be a UUID".to_owned())?;
         tokio::fs::create_dir_all(&self.workspace_root)
             .await
@@ -153,14 +154,28 @@ impl CodexConfig {
         let canonical_root = tokio::fs::canonicalize(&self.workspace_root)
             .await
             .map_err(|error| format!("cannot resolve workspace root: {error}"))?;
-        let project_dir = canonical_root.join("projects").join(project_id);
+
+        // 先校验 projects 容器目录，避免符号链接在拒绝请求前向允许根之外创建项目目录。
+        let projects_dir = canonical_root.join("projects");
+        tokio::fs::create_dir_all(&projects_dir)
+            .await
+            .map_err(|error| format!("cannot create projects directory: {error}"))?;
+        let canonical_projects = tokio::fs::canonicalize(&projects_dir)
+            .await
+            .map_err(|error| format!("cannot resolve projects directory: {error}"))?;
+        if !canonical_projects.starts_with(&canonical_root) {
+            return Err("projects directory escapes XIEXU_WORKSPACE_ROOT".to_owned());
+        }
+
+        // 项目目录创建后再次解析真实路径，拒绝预先存在且指向允许根之外的项目级符号链接。
+        let project_dir = canonical_projects.join(project_id);
         tokio::fs::create_dir_all(&project_dir)
             .await
             .map_err(|error| format!("cannot create project workspace: {error}"))?;
         let canonical_project = tokio::fs::canonicalize(&project_dir)
             .await
             .map_err(|error| format!("cannot resolve project workspace: {error}"))?;
-        if !canonical_project.starts_with(&canonical_root) {
+        if !canonical_project.starts_with(&canonical_projects) {
             return Err("project workspace escapes XIEXU_WORKSPACE_ROOT".to_owned());
         }
         Ok(canonical_project)
@@ -249,4 +264,84 @@ fn parse_output(success: bool, stdout: &[u8], stderr: &[u8]) -> Result<CodexRunO
 /// 按字符边界截断外部输出，防止单次运行无限放大数据库记录。
 fn truncate(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CodexConfig, ExecutionMode};
+    use std::path::PathBuf;
+    use uuid::Uuid;
+
+    /// 为单个测试创建不会与并行用例冲突的临时根目录。
+    fn temporary_root(case_name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("xiexu-{case_name}-{}", Uuid::new_v4()))
+    }
+
+    /// 构造只用于路径校验的受控模式配置，不启动外部 Codex 进程。
+    fn test_config(workspace_root: PathBuf) -> CodexConfig {
+        CodexConfig {
+            executable: PathBuf::from("codex"),
+            mode: ExecutionMode::Controlled,
+            workspace_root,
+            max_run_seconds: 30,
+        }
+    }
+
+    /// 合法 UUID 应在受管 projects 目录内创建并返回真实路径。
+    #[tokio::test]
+    async fn prepares_workspace_inside_managed_root() {
+        // 准备独立临时目录并执行正常路径。
+        let root = temporary_root("workspace");
+        let project_id = Uuid::new_v4().to_string();
+        let workspace = test_config(root.clone())
+            .prepare_workspace(&project_id)
+            .await
+            .expect("prepare managed workspace");
+
+        // 返回路径必须位于真实 projects 目录，验证后清理测试资产。
+        let expected_root = std::fs::canonicalize(root.join("projects"))
+            .expect("canonical projects root");
+        assert!(workspace.starts_with(expected_root));
+        std::fs::remove_dir_all(root).expect("remove test workspace");
+    }
+
+    /// 非 UUID 输入必须在任何项目目录创建前被拒绝。
+    #[tokio::test]
+    async fn rejects_non_uuid_project_id_without_side_effects() {
+        // 使用路径穿越形态输入，确认校验先于文件系统写入。
+        let root = temporary_root("invalid-id");
+        let error = test_config(root.clone())
+            .prepare_workspace("../outside")
+            .await
+            .expect_err("reject invalid project id");
+
+        // 根目录也不应被创建，避免非法请求留下路径副作用。
+        assert_eq!(error, "project_id must be a UUID");
+        assert!(!root.exists());
+    }
+
+    /// Unix 环境下 projects 符号链接不得把项目创建操作引导到允许根之外。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_projects_symlink_escape_before_project_creation() {
+        use std::os::unix::fs::symlink;
+
+        // 预置指向外部目录的 projects 链接，模拟被篡改的挂载或工作区。
+        let root = temporary_root("projects-link");
+        let outside = temporary_root("outside");
+        std::fs::create_dir_all(&root).expect("create workspace root");
+        std::fs::create_dir_all(&outside).expect("create outside root");
+        symlink(&outside, root.join("projects")).expect("create projects symlink");
+        let project_id = Uuid::new_v4().to_string();
+
+        // 校验应在项目目录创建前失败，外部目录保持为空。
+        let error = test_config(root.clone())
+            .prepare_workspace(&project_id)
+            .await
+            .expect_err("reject projects symlink escape");
+        assert_eq!(error, "projects directory escapes XIEXU_WORKSPACE_ROOT");
+        assert!(!outside.join(project_id).exists());
+        std::fs::remove_dir_all(root).expect("remove workspace root");
+        std::fs::remove_dir_all(outside).expect("remove outside root");
+    }
 }

@@ -16,6 +16,9 @@ use tokio_postgres::{Client, NoTls, Row};
 use tower_http::services::{ServeDir, ServeFile};
 use uuid::Uuid;
 
+/// 当前发布要求数据库至少完成的迁移版本，用于 readiness 阻止旧结构接收流量。
+const LATEST_MIGRATION_VERSION: &str = "0007_m5_workflows";
+
 /// 服务端共享配置，统一承载数据库地址和 Codex 运行状态探测边界。
 #[derive(Clone)]
 pub(crate) struct AppState {
@@ -130,8 +133,17 @@ async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
             eprintln!("database readiness connection ended: {error}");
         }
     });
-    let migration_exists = client.query_one("SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'schema_migrations')", &[]).await.ok().and_then(|row| row.try_get::<_, bool>(0).ok()).unwrap_or(false);
-    if migration_exists {
+    // 同时检查迁移表与当前发布要求的版本，避免只有空迁移表或旧版本时误报 ready。
+    let migration_ready = client
+        .query_one(
+            "SELECT to_regclass('public.schema_migrations') IS NOT NULL AND EXISTS (SELECT 1 FROM schema_migrations WHERE version = $1)",
+            &[&LATEST_MIGRATION_VERSION],
+        )
+        .await
+        .ok()
+        .and_then(|row| row.try_get::<_, bool>(0).ok())
+        .unwrap_or(false);
+    if migration_ready {
         (
             StatusCode::OK,
             Json(ReadyResponse {

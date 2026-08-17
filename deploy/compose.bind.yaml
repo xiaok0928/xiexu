@@ -1,0 +1,7 @@
+services:
+  app:
+    volumes:
+      # 显式启用本覆盖文件时，将宿主机项目目录挂到受管 projects 子目录；基础配置仍保留其他命名卷。
+      - type: bind
+        source: ${XIEXU_PROJECTS_DIR:?XIEXU_PROJECTS_DIR must be an absolute host path}
+        target: /workspace/projects
