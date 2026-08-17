@@ -1,0 +1,10 @@
+[package]
+name = "xiexu-migrate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+tokio-postgres.workspace = true
+uuid.workspace = true

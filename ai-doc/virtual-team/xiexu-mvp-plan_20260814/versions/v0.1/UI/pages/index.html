@@ -1,0 +1,379 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>协序 xiexu v0.1 UI Design</title>
+    <link rel="stylesheet" href="./xiexu-ui-demo.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="主导航">
+        <div class="brand">
+          <div class="brand-mark">协</div>
+          <div>
+            <div class="brand-name">协序</div>
+            <div class="brand-subtitle">xiexu v0.1</div>
+          </div>
+        </div>
+        <nav class="nav-list">
+          <button class="nav-item active" data-view="board">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h6v14H4zM14 5h6v8h-6zM14 16h6v3h-6z"/></svg>
+            任务面板
+          </button>
+          <button class="nav-item" data-view="project">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h7l2 2h9v10H3zM3 5h7l2 2H3z"/></svg>
+            项目空间
+          </button>
+          <button class="nav-item" data-view="workflow">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6h5v5H6zM15 4h5v5h-5zM15 15h5v5h-5zM11 8h4M12 10l3 7"/></svg>
+            工作流
+          </button>
+          <button class="nav-item" data-view="chat">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v10H8l-4 4z"/></svg>
+            新对话
+          </button>
+          <button class="nav-item" data-view="agents">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4a4 4 0 1 1 0 8 4 4 0 0 1 0-8zM4 20a8 8 0 0 1 16 0z"/></svg>
+            Agent
+          </button>
+          <button class="nav-item" data-view="runs">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v4H5zM5 10h14v4H5zM5 16h14v4H5z"/></svg>
+            运行记录
+          </button>
+          <button class="nav-item" data-view="settings">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8zM4 12h3M17 12h3M12 4v3M12 17v3"/></svg>
+            设置
+          </button>
+        </nav>
+        <div class="side-section">
+          <div class="side-title">最近项目</div>
+          <button class="side-link active">xiexu</button>
+          <button class="side-link">relay-adapter</button>
+          <button class="side-link">taskboard-web</button>
+        </div>
+        <div class="user-box">
+          <div class="avatar">HB</div>
+          <div>
+            <div class="user-name">Human</div>
+            <div class="user-role">本地管理员</div>
+          </div>
+        </div>
+      </aside>
+
+      <main class="workspace">
+        <header class="topbar">
+          <div>
+            <div class="breadcrumb">协序 / MVP 工作台</div>
+            <h1 id="viewTitle">任务面板</h1>
+          </div>
+          <div class="toolbar">
+            <button class="icon-btn" title="搜索">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 5a5 5 0 1 1 0 10 5 5 0 0 1 0-10zM14 14l5 5"/></svg>
+            </button>
+            <button class="icon-btn" title="过滤">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M7 12h10M10 18h4"/></svg>
+            </button>
+            <button class="text-btn" data-view="workflow">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
+              自动化
+            </button>
+            <button class="icon-btn primary" title="新建">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+            </button>
+          </div>
+        </header>
+
+        <section class="view active" id="view-board" data-title="任务面板">
+          <div class="view-tabs">
+            <button class="tab active">看板</button>
+            <button class="tab">列表</button>
+            <button class="tab">甘特</button>
+            <select class="mobile-column-select" aria-label="选择看板列">
+              <option>Backlog</option>
+              <option>Todo</option>
+              <option>方案待确认</option>
+              <option>处理中</option>
+              <option>等待验收</option>
+            </select>
+          </div>
+
+          <div class="board-layout">
+            <div class="kanban">
+              <section class="column backlog">
+                <div class="column-head"><span>Backlog</span><button title="新增想法">+</button></div>
+                <article class="task-card" data-task="idea">
+                  <div class="task-meta">IDEA-18 · 仅记录</div>
+                  <h3>记录一个可通过自然语言创建任务的想法</h3>
+                  <div class="task-tags"><span>备忘</span><span>不执行</span></div>
+                </article>
+                <article class="task-card" data-task="ops">
+                  <div class="task-meta">IDEA-21 · 运营</div>
+                  <h3>每周整理客户反馈摘要</h3>
+                  <div class="task-tags"><span>想法</span><span>可拖入 Todo</span></div>
+                </article>
+              </section>
+
+              <section class="column todo">
+                <div class="column-head"><span>Todo</span><button title="新增任务">+</button></div>
+                <article class="task-card selected" data-task="parent">
+                  <div class="task-meta">REQ-104 · xiexu · 父任务</div>
+                  <h3>实现任务面板与项目空间的共享任务事实源</h3>
+                  <div class="task-line"></div>
+                  <div class="task-footer">
+                    <span class="agent-chip">协调 Agent</span>
+                    <label class="confirm-check"><input type="checkbox" checked> 方案确认</label>
+                  </div>
+                  <button class="expand-btn" data-toggle-children>展开 3 个子任务</button>
+                  <div class="child-list">
+                    <div class="child-row">BE · 状态机与 API</div>
+                    <div class="child-row">FE · 看板同步视图</div>
+                    <div class="child-row">QA · 父子验收矩阵</div>
+                  </div>
+                </article>
+                <article class="task-card" data-task="chat">
+                  <div class="task-meta">REQ-109 · 项目群聊生成</div>
+                  <h3>从项目群聊发布需求并同步任务卡片</h3>
+                  <div class="task-footer">
+                    <span class="agent-chip">PM Agent</span>
+                    <label class="confirm-check"><input type="checkbox" checked> 方案确认</label>
+                  </div>
+                </article>
+              </section>
+
+              <section class="column review">
+                <div class="column-head"><span>方案待确认</span><button title="新增">+</button></div>
+                <article class="task-card" data-task="plan">
+                  <div class="task-meta">REQ-096 · 方案 v2</div>
+                  <h3>工作流人工确认节点评论流转</h3>
+                  <div class="task-tags"><span>等待 Human</span><span>评论确认</span></div>
+                </article>
+              </section>
+
+              <section class="column progress">
+                <div class="column-head"><span>处理中</span><button title="新增">+</button></div>
+                <article class="task-card" data-task="workflow">
+                  <div class="task-meta">WF-12 · 每周项目文档刷新</div>
+                  <h3>扫描父任务完成后的项目文档遗漏</h3>
+                  <div class="progress-bar"><span style="width: 64%"></span></div>
+                  <div class="task-footer">
+                    <span class="agent-chip">SRE Agent</span>
+                    <span class="run-chip">running</span>
+                  </div>
+                </article>
+                <article class="task-card" data-task="subtask">
+                  <div class="task-meta">REQ-104-2 · 子任务</div>
+                  <h3>前端看板订阅 execution_events</h3>
+                  <div class="progress-bar"><span style="width: 42%"></span></div>
+                  <div class="task-tags"><span>父 REQ-104</span><span>执行标记 running</span></div>
+                </article>
+              </section>
+
+              <section class="column accept">
+                <div class="column-head"><span>等待验收</span><button title="新增">+</button></div>
+                <article class="task-card" data-task="accept">
+                  <div class="task-meta">REQ-088 · 部分验收</div>
+                  <h3>Agent 身份管理和固定记忆摘要</h3>
+                  <div class="task-tags"><span>2/3 子任务已验收</span><span>待评论</span></div>
+                </article>
+              </section>
+            </div>
+
+            <aside class="detail-drawer" aria-label="任务详情">
+              <div class="drawer-head">
+                <div>
+                  <div class="task-meta" id="drawerMeta">REQ-104 · xiexu · 父任务</div>
+                  <h2 id="drawerTitle">实现任务面板与项目空间的共享任务事实源</h2>
+                </div>
+                <span class="status-pill">Todo / queued</span>
+              </div>
+              <div class="fact-source">
+                <span>同一事实源</span>
+                <strong>Task.task_stage</strong>
+                <span>看板阶段</span>
+                <strong>ExecutionJob.status</strong>
+                <span>执行标记</span>
+              </div>
+              <div class="section-title">方案摘要</div>
+              <p class="body-copy">协调 Agent 已识别 3 个子任务。Human 评论“确认方案”后进入执行；评论“先改接口边界”会保持在方案待确认并追加修改意见。</p>
+              <div class="section-title">评论验收</div>
+              <div class="comment-stream">
+                <div class="comment">
+                  <div class="avatar small">AI</div>
+                  <div><b>协调 Agent</b><p>建议先实现任务状态 API，再接看板实时订阅。</p></div>
+                </div>
+                <div class="comment human-comment">
+                  <div class="avatar small">HB</div>
+                  <div><b>Human</b><p>确认方案，先做父子任务展开和验收流转。</p><span class="intent-pass">识别：方案确认</span></div>
+                </div>
+              </div>
+              <div class="comment-box">
+                <input value="验收通过，子任务同步关闭。" aria-label="评论内容">
+                <button>发送</button>
+              </div>
+            </aside>
+          </div>
+        </section>
+
+        <section class="view" id="view-project" data-title="项目空间">
+          <div class="two-pane">
+            <div class="main-panel">
+              <div class="project-head">
+                <div>
+                  <div class="breadcrumb">项目 / xiexu</div>
+                  <h2>协序 Web MVP</h2>
+                </div>
+                <span class="health live">Runner live</span>
+              </div>
+              <div class="project-tabs">
+                <button class="tab active">总览</button><button class="tab">项目群聊</button><button class="tab">任务</button><button class="tab">文档</button><button class="tab">Agent</button><button class="tab">交付物</button>
+              </div>
+              <div class="metrics-grid">
+                <div class="metric"><span>活跃任务</span><strong>18</strong></div>
+                <div class="metric"><span>等待确认</span><strong>4</strong></div>
+                <div class="metric"><span>运行中</span><strong>7</strong></div>
+                <div class="metric"><span>文档版本</span><strong>12</strong></div>
+              </div>
+              <div class="chat-panel">
+                <div class="section-title">项目群聊</div>
+                <div class="message"><b>Human</b><p>@协调 Agent 新增一个任务：项目文档在父任务完成后自动刷新。</p></div>
+                <div class="message"><b>协调 Agent</b><p>已生成任务卡 REQ-117，并关联项目 xiexu。</p></div>
+                <div class="message"><b>BE Agent</b><p>@FE Agent 我需要一个 `projectDocumentVersions` 查询接口。</p></div>
+                <div class="message"><b>FE Agent</b><p>收到，完成后会在你的子任务评论区回复。</p></div>
+              </div>
+            </div>
+            <aside class="side-panel">
+              <div class="section-title">项目文档</div>
+              <div class="doc-row"><span>architecture-baseline.md</span><b>v7</b></div>
+              <div class="doc-row"><span>mvp-scope.md</span><b>v4</b></div>
+              <div class="doc-row"><span>project-memory.md</span><b>v12</b></div>
+              <div class="section-title">刷新记录</div>
+              <div class="timeline"><span>17:30</span><p>父任务 REQ-088 完成后刷新</p></div>
+              <div class="timeline"><span>16:00</span><p>定时兜底发现遗漏变更</p></div>
+            </aside>
+          </div>
+        </section>
+
+        <section class="view" id="view-workflow" data-title="工作流">
+          <div class="workflow-grid">
+            <aside class="workflow-list">
+              <button class="workflow-item active"><b>每周项目文档刷新</b><span>下次 08-18 09:00</span></button>
+              <button class="workflow-item"><b>每日 Todo 扫描</b><span>周期 6 小时</span></button>
+              <button class="workflow-item"><b>不规则版本检查</b><span>AI 解析时间表</span></button>
+            </aside>
+            <div class="canvas-panel">
+              <div class="canvas-toolbar">
+                <button class="icon-btn" title="保存"><svg viewBox="0 0 24 24"><path d="M5 4h12l2 2v14H5zM8 4v6h8V4M8 18h8"/></svg></button>
+                <button class="text-btn"><svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>运行</button>
+                <button class="text-btn">暂停</button>
+                <button class="text-btn danger">终止</button>
+              </div>
+              <div class="canvas">
+                <div class="node start" style="left:40px;top:90px">开始</div>
+                <div class="connector horizontal" style="left:134px;top:115px;width:90px"></div>
+                <div class="node action" style="left:230px;top:70px"><b>扫描项目</b><span>读取父任务完成记录</span></div>
+                <div class="connector horizontal" style="left:390px;top:115px;width:72px"></div>
+                <div class="node decision" style="left:470px;top:70px"><b>有遗漏?</b><span>是 / 否</span></div>
+                <div class="connector vertical" style="left:535px;top:155px;height:70px"></div>
+                <span class="line-label" style="left:545px;top:172px">是</span>
+                <div class="node manual" style="left:458px;top:230px"><b>人工确认</b><span>评论补充意见</span></div>
+                <div class="connector horizontal" style="left:620px;top:115px;width:72px"></div>
+                <span class="line-label" style="left:640px;top:92px">否</span>
+                <div class="node end" style="left:700px;top:90px">结束</div>
+              </div>
+            </div>
+            <aside class="property-panel">
+              <div class="section-title">运行配置</div>
+              <label class="field"><span>执行方式</span><select><option>周期性重复</option><option>预定时间</option><option>AI 解析重复规则</option></select></label>
+              <label class="field"><span>描述</span><textarea>每周二上午 9 点刷新项目文档；每月最后一个工作日补充检查一次。</textarea></label>
+              <div class="schedule-preview">
+                <b>结构化预览</b>
+                <p>weekly: Tue 09:00</p>
+                <p>monthly: last_workday 17:00</p>
+              </div>
+              <div class="section-title">最近运行</div>
+              <div class="run-row"><span>WF-RUN-203</span><b>running</b></div>
+              <div class="run-row"><span>WF-RUN-198</span><b>succeeded</b></div>
+            </aside>
+          </div>
+        </section>
+
+        <section class="view" id="view-chat" data-title="新对话">
+          <div class="chat-layout">
+            <aside class="conversation-list">
+              <button class="conversation active">与 PM Agent 讨论任务拆分</button>
+              <button class="conversation">向 SA Agent 咨询状态机</button>
+              <button class="conversation">让 UI Agent 整理看板字段</button>
+            </aside>
+            <div class="direct-chat">
+              <div class="message"><b>Human</b><p>我想把一个想法整理成 Todo，但还没确定项目。</p></div>
+              <div class="message"><b>PM Agent</b><p>我会先保存在 Backlog。你确认后可以拖入 Todo，再由协调 Agent 扫描并处理。</p></div>
+              <div class="message"><b>Human</b><p>创建到 xiexu 项目。</p></div>
+              <div class="message"><b>PM Agent</b><p>已准备任务草稿，默认需要方案确认。</p></div>
+              <div class="composer"><input value="补充一句：任务面板要能展开子任务"><button>发送</button></div>
+            </div>
+            <aside class="context-panel">
+              <div class="section-title">当前 Agent</div>
+              <div class="agent-card flat"><div class="avatar">PM</div><div><b>PM Agent</b><p>需求整理、范围收口、验收标准</p></div></div>
+              <button class="wide-btn">生成任务草稿</button>
+            </aside>
+          </div>
+        </section>
+
+        <section class="view" id="view-agents" data-title="Agent">
+          <div class="agent-grid">
+            <article class="agent-card"><div class="avatar">CO</div><h3>协调 Agent</h3><p>拆分任务、指派执行 Agent、汇总进度。</p><span>固定项目 Agent</span></article>
+            <article class="agent-card"><div class="avatar">PM</div><h3>PM Agent</h3><p>需求澄清、范围控制、验收口径。</p><span>Relay 默认角色</span></article>
+            <article class="agent-card"><div class="avatar">SA</div><h3>SA Agent</h3><p>架构、状态机、数据模型。</p><span>Relay 默认角色</span></article>
+            <article class="agent-card"><div class="avatar">UI</div><h3>UI Agent</h3><p>页面、组件、状态、交接规格。</p><span>Relay 默认角色</span></article>
+            <article class="agent-card"><div class="avatar">+</div><h3>创建 Agent</h3><p>输入职责后由 AI 优化成 Agent 身份。</p><span>可补充特定职责</span></article>
+          </div>
+          <div class="memory-panel">
+            <div class="section-title">固定 Agent 记忆</div>
+            <p>这里记录 Agent 执行任务时沉淀的问题解决经验和运行经验，不表示聊天隐私。</p>
+            <div class="memory-row"><b>UI Agent</b><span>看板卡片字段不超过三层信息密度。</span></div>
+            <div class="memory-row"><b>SA Agent</b><span>看板阶段与执行状态必须分离。</span></div>
+          </div>
+        </section>
+
+        <section class="view" id="view-runs" data-title="运行记录">
+          <div class="runs-table">
+            <div class="table-row header"><span>来源</span><span>状态</span><span>Agent</span><span>输出</span><span>时间</span></div>
+            <button class="table-row"><span>REQ-104 / 方案生成</span><span class="status ok">succeeded</span><span>协调 Agent</span><span>2</span><span>17:40</span></button>
+            <button class="table-row"><span>WF-RUN-203 / 文档刷新</span><span class="status run">running</span><span>SRE Agent</span><span>1</span><span>17:31</span></button>
+            <button class="table-row"><span>REQ-088-3 / 验收返工</span><span class="status warn">blocked</span><span>FE Agent</span><span>0</span><span>16:58</span></button>
+          </div>
+          <div class="run-detail">
+            <div class="section-title">WF-RUN-203</div>
+            <div class="timeline"><span>17:31</span><p>runner 领取 execution_job</p></div>
+            <div class="timeline"><span>17:32</span><p>扫描项目文档版本</p></div>
+            <div class="timeline"><span>17:33</span><p>写入 run_output：project-doc-delta.md</p></div>
+          </div>
+        </section>
+
+        <section class="view" id="view-settings" data-title="设置">
+          <div class="settings-grid">
+            <div class="settings-section">
+              <div class="section-title">任务默认项</div>
+              <label class="toggle"><input type="checkbox" checked> Todo 默认需要方案确认</label>
+              <label class="field"><span>Todo 扫描周期</span><select><option>每 6 小时</option><option>每天</option><option>手动</option></select></label>
+            </div>
+            <div class="settings-section">
+              <div class="section-title">Runner 状态</div>
+              <div class="doc-row"><span>PostgreSQL</span><b>healthy</b></div>
+              <div class="doc-row"><span>runner</span><b>live</b></div>
+              <div class="doc-row"><span>migrate</span><b>v0.1.0</b></div>
+            </div>
+            <div class="settings-section wide">
+              <div class="section-title">工作区映射</div>
+              <div class="path-map"><span>宿主机</span><code>/Volumes/Tools/workspace</code></div>
+              <div class="path-map"><span>容器内</span><code>/workspaces/external/default</code></div>
+              <div class="path-map"><span>托管工作区</span><code>/workspaces/managed</code></div>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+    <script src="./xiexu-ui-demo.js"></script>
+  </body>
+</html>

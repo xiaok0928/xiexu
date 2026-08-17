@@ -1,0 +1,49 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-xiexu}
+      POSTGRES_USER: ${POSTGRES_USER:-xiexu}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-xiexu-dev-only}
+    volumes:
+      - xiexu_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgres://xiexu:xiexu-dev-only@postgres:5432/xiexu}
+      SERVER_BIND: 0.0.0.0:8080
+      RUNNER_ID: ${RUNNER_ID:-runner-1}
+      RUNNER_NAME: ${RUNNER_NAME:-xiexu-runner}
+      CODEX_BIN: /usr/local/bin/codex
+      CODEX_EXECUTION_MODE: ${CODEX_EXECUTION_MODE:-controlled}
+      CODEX_MAX_RUN_SECONDS: ${CODEX_MAX_RUN_SECONDS:-1800}
+      CODEX_HOME: /var/lib/xiexu/codex-home
+      XIEXU_WORKSPACE_ROOT: /workspace
+    ports:
+      - "${XIEXU_PORT:-8080}:8080"
+    volumes:
+      - xiexu_workspace:/workspace
+      - xiexu_artifacts:/var/lib/xiexu/artifacts
+      - xiexu_codex_home:/var/lib/xiexu/codex-home
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/readyz').then(response => response.text()).then(body => { if (!body.includes('ready')) process.exit(1) }).catch(() => process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  xiexu_pgdata:
+  xiexu_workspace:
+  xiexu_artifacts:
+  xiexu_codex_home:
