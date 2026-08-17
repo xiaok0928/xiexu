@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "./styles.css";
 
@@ -168,6 +168,93 @@ type DocumentDiff = {
   /** 仅包含实际变化章节的前后快照。 */
   changes: Array<{ section_key: string; change_type: string; before?: DocumentSection | null; after?: DocumentSection | null }>;
 };
+/** 后端持久化的工作流节点类型，界面分别展示为开始、结束、执行、判断和人工确认。 */
+type WorkflowNodeType = "start" | "end" | "execute" | "condition" | "human_confirm";
+/** 工作流画布节点，坐标以画布左上角为原点并持久化到版本定义。 */
+type WorkflowNode = { id: string; type: WorkflowNodeType; label: string; config: Record<string, unknown>; x: number; y: number };
+/** 工作流画布连线，判断节点的出口使用是/否标签表达分支。 */
+type WorkflowEdge = { id: string; source: string; target: string; label: string; condition: Record<string, unknown> };
+/** 工作流摘要及其当前不可变版本号。 */
+type WorkflowSummary = {
+  id: string;
+  project_id: string;
+  name: string;
+  description: string;
+  status: string;
+  current_version_no: number;
+  created_by: string;
+  created_at: string;
+  updated_at: string;
+};
+/** 工作流详情包含当前版本及可恢复的结构化画布。 */
+type WorkflowDetail = WorkflowSummary & {
+  version: {
+    id: string;
+    version_no: number;
+    status: string;
+    created_by: string;
+    created_at: string;
+    nodes: WorkflowNode[];
+    edges: WorkflowEdge[];
+  };
+};
+/** 工作流运行摘要，控制接口会在同一结构上返回最新状态。 */
+type WorkflowRun = {
+  id: string;
+  workflow_id: string;
+  version_id: string;
+  project_id: string;
+  status: string;
+  trigger_type: string;
+  input: unknown;
+  output: unknown;
+  error_message?: string | null;
+  started_at?: string | null;
+  finished_at?: string | null;
+  created_at: string;
+  updated_at: string;
+};
+/** 工作流运行事件用于还原节点执行状态和输出时间线。 */
+type WorkflowRunEvent = { id: number; event_type: string; node_key?: string | null; payload: Record<string, unknown>; created_at: string };
+/** 单次运行详情追加完整事件列表。 */
+type WorkflowRunDetail = WorkflowRun & { events: WorkflowRunEvent[] };
+/** 工作流定时规则，AI 解析结果必须以结构化对象持久化。 */
+type WorkflowSchedule = {
+  id: string;
+  workflow_id: string;
+  schedule_type: "periodic" | "scheduled" | "ai_parsed";
+  schedule_expression: string;
+  parsed_rule: Record<string, unknown>;
+  timezone: string;
+  enabled: boolean;
+  next_run_at?: string | null;
+  created_at: string;
+  updated_at: string;
+};
+/** 人工确认请求，评论与布尔决定会共同进入运行快照。 */
+type WorkflowApproval = {
+  id: string;
+  request_type: string;
+  workflow_run_id?: string | null;
+  node_run_id?: string | null;
+  task_id?: string | null;
+  status: string;
+  prompt: string;
+  response_data: Record<string, unknown>;
+  requested_at: string;
+  resolved_at?: string | null;
+  resolved_by?: string | null;
+};
+/** 工作流运行及其子任务产生的统一输出。 */
+type WorkflowOutput = {
+  id: string;
+  job_id: string;
+  task_id?: string | null;
+  output_type: string;
+  content: string;
+  node_run_id?: string | null;
+  created_at: string;
+};
 
 const stages = ["backlog", "todo", "plan_review", "in_progress", "acceptance"];
 const stageLabels: Record<string, string> = { backlog: "Backlog", todo: "Todo", plan_review: "方案待确认", in_progress: "处理中", acceptance: "等待验收" };
@@ -200,6 +287,7 @@ async function api<T>(path: string, options?: RequestInit): Promise<T> {
   // 当前 API 均返回 JSON，因此非成功响应直接作为异常抛出。
   const response = await fetch(path, { headers: { "Content-Type": "application/json" }, ...options });
   if (!response.ok) throw new Error(await response.text());
+  if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
 }
 
@@ -263,7 +351,7 @@ function App() {
           <span className="brand-mark">协</span>
           <div>
             <b>协序</b>
-            <small>xiexu M3</small>
+            <small>xiexu M5</small>
           </div>
         </div>
         <nav className="nav-list">
@@ -314,7 +402,7 @@ function App() {
         {view === "project" && project && <ProjectSpace project={project} onReload={() => loadBoard(project.id)} onError={setError} />}
         {view === "chat" && <DirectChat onError={setError} />}
         {view === "agents" && <AgentCenter project={project} onError={setError} />}
-        {view === "workflow" && <Placeholder title="工作流" description="工作流画布属于后续里程碑，本阶段不伪造运行数据。" />}
+        {view === "workflow" && project && <WorkflowCenter project={project} onError={setError} />}
         {view === "runs" && <Placeholder title="运行记录" description="任务运行记录已在任务详情展示，跨任务总览将在后续阶段接入。" />}
         {view === "settings" && <Placeholder title="设置" description="MVP 暂不启用权限管理，系统设置将在后续接入。" />}
       </main>
@@ -815,6 +903,743 @@ function AgentCenter({ project, onError }: { project?: Project; onError: (messag
           <p className="muted">选择 Agent</p>
         )}
       </div>
+    </section>
+  );
+}
+
+/** 工作流节点类型对应的中文业务名称。 */
+const workflowNodeLabels: Record<WorkflowNodeType, string> = {
+  start: "开始",
+  end: "结束",
+  execute: "执行",
+  condition: "判断",
+  human_confirm: "人工确认",
+};
+/** 工作流节点在工具箱和画布中使用的紧凑符号。 */
+const workflowNodeIcons: Record<WorkflowNodeType, string> = { start: "▶", end: "■", execute: "⚙", condition: "◇", human_confirm: "✓" };
+
+/** 工作流模块：在一个独立工作区内维护画布、版本保存和运行审计。 */
+function WorkflowCenter({ project, onError }: { project: Project; onError: (message: string) => void }) {
+  const [workflows, setWorkflows] = useState<WorkflowSummary[]>([]);
+  const [selectedId, setSelectedId] = useState("");
+  const [detail, setDetail] = useState<WorkflowDetail>();
+  const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
+  const [nodes, setNodes] = useState<WorkflowNode[]>([]);
+  const [edges, setEdges] = useState<WorkflowEdge[]>([]);
+  const [selectedNodeId, setSelectedNodeId] = useState("");
+  const [connectionSourceId, setConnectionSourceId] = useState("");
+  const [branchLabel, setBranchLabel] = useState<"是" | "否">("是");
+  const [runs, setRuns] = useState<WorkflowRun[]>([]);
+  const [selectedRunId, setSelectedRunId] = useState("");
+  const [runDetail, setRunDetail] = useState<WorkflowRunDetail>();
+  const [approvals, setApprovals] = useState<WorkflowApproval[]>([]);
+  const [outputs, setOutputs] = useState<WorkflowOutput[]>([]);
+  const [approvalComments, setApprovalComments] = useState<Record<string, string>>({});
+  const [schedules, setSchedules] = useState<WorkflowSchedule[]>([]);
+  const [scheduleType, setScheduleType] = useState<WorkflowSchedule["schedule_type"]>("periodic");
+  const [scheduleExpression, setScheduleExpression] = useState("");
+  const [scheduleRule, setScheduleRule] = useState("{}");
+  const [scheduleTimezone, setScheduleTimezone] = useState("Asia/Shanghai");
+  const [scheduleNextRunAt, setScheduleNextRunAt] = useState("");
+  const [editingScheduleId, setEditingScheduleId] = useState("");
+  const [activePane, setActivePane] = useState<"canvas" | "schedules" | "runs">("canvas");
+  const [saving, setSaving] = useState(false);
+  const [notice, setNotice] = useState("");
+  const canvasRef = useRef<HTMLDivElement>(null);
+  const selectedNode = nodes.find((node) => node.id === selectedNodeId);
+
+  /** 加载当前项目的工作流目录，并保留仍然存在的选择。 */
+  async function loadWorkflows(preferredId?: string) {
+    // 项目是工作流的数据边界，切换项目时不沿用其他项目的工作流主键。
+    const result = await api<{ items: WorkflowSummary[] }>(`/api/projects/${project.id}/workflows`);
+    const nextId = result.items.find((item) => item.id === (preferredId ?? selectedId))?.id ?? result.items[0]?.id ?? "";
+    setWorkflows(result.items);
+    setSelectedId(nextId);
+  }
+
+  /** 加载工作流当前版本和运行摘要，保存后的画布事实以服务端响应为准。 */
+  async function loadWorkflow(workflowId: string) {
+    // 定义和运行记录可以独立读取，合并等待后再刷新编辑器，避免出现半新半旧状态。
+    const [workflow, runResult, scheduleResult] = await Promise.all([
+      api<WorkflowDetail>(`/api/workflows/${workflowId}`),
+      api<{ items: WorkflowRun[] }>(`/api/workflows/${workflowId}/runs`),
+      api<{ items: WorkflowSchedule[] }>(`/api/workflows/${workflowId}/schedules`),
+    ]);
+
+    // 旧版默认骨架没有坐标时按水平方向排布，确保第一次打开即可读。
+    const restoredNodes = workflow.version.nodes.map((node, index) =>
+      node.x === 0 && node.y === 0 ? { ...node, x: 72 + index * 230, y: 210 } : node,
+    );
+
+    // 仅在所有事实读取成功后替换本地编辑草稿和运行选择。
+    setDetail(workflow);
+    setName(workflow.name);
+    setDescription(workflow.description);
+    setNodes(restoredNodes);
+    setEdges(workflow.version.edges);
+    setSelectedNodeId((current) => (workflow.version.nodes.some((node) => node.id === current) ? current : ""));
+    setConnectionSourceId("");
+    setRuns(runResult.items);
+    setSchedules(scheduleResult.items);
+    setSelectedRunId((current) => (runResult.items.some((run) => run.id === current) ? current : runResult.items[0]?.id ?? ""));
+  }
+
+  /** 加载单次运行的事件时间线和节点输出。 */
+  async function loadRun(runId: string) {
+    // 运行详情始终覆盖旧详情，防止控制状态变化后继续展示过期输出。
+    const [result, approvalResult, outputResult] = await Promise.all([
+      api<WorkflowRunDetail>(`/api/workflow-runs/${runId}`),
+      api<{ items: WorkflowApproval[] }>(`/api/workflow-runs/${runId}/approvals`),
+      api<{ items: WorkflowOutput[] }>(`/api/workflow-runs/${runId}/outputs`),
+    ]);
+
+    // 三类运行事实成功读取后一次性替换详情，避免审批已刷新而输出仍来自上一运行。
+    setRunDetail(result);
+    setApprovals(approvalResult.items);
+    setOutputs(outputResult.items);
+  }
+
+  useEffect(() => {
+    // 项目变化时清空上一个项目的编辑上下文，再建立新的工作流目录。
+    setSelectedId("");
+    setDetail(undefined);
+    setRunDetail(undefined);
+    void loadWorkflows().catch((cause) => onError(cause instanceof Error ? cause.message : "工作流目录加载失败"));
+  }, [project.id]);
+  useEffect(() => {
+    // 选择工作流后恢复其当前版本和运行历史。
+    if (!selectedId) return;
+    void loadWorkflow(selectedId).catch((cause) => onError(cause instanceof Error ? cause.message : "工作流加载失败"));
+  }, [selectedId]);
+  useEffect(() => {
+    // 运行选择变化时读取完整事件；空选择必须同步清空右侧详情。
+    if (!selectedRunId) {
+      setRunDetail(undefined);
+      setApprovals([]);
+      setOutputs([]);
+      return;
+    }
+    void loadRun(selectedRunId).catch((cause) => onError(cause instanceof Error ? cause.message : "运行详情加载失败"));
+  }, [selectedRunId]);
+
+  /** 创建一个带开始和结束节点的工作流。 */
+  async function createWorkflow() {
+    // 仅名称是创建必填项，默认骨架由服务端生成并成为版本 1。
+    const workflowName = window.prompt("工作流名称");
+    if (!workflowName?.trim()) return;
+    try {
+      const created = await api<WorkflowSummary>(`/api/projects/${project.id}/workflows`, {
+        method: "POST",
+        body: JSON.stringify({ name: workflowName.trim(), description: "" }),
+      });
+      await loadWorkflows(created.id);
+      setSelectedId(created.id);
+      setNotice("工作流已创建");
+    } catch (cause) {
+      onError(cause instanceof Error ? cause.message : "工作流创建失败");
+    }
+  }
+
+  /** 将当前画布追加保存为不可变版本。 */
+  async function saveWorkflow() {
+    // 保存前保持最小结构约束，具体连线引用和类型仍由服务端做权威校验。
+    if (!detail || !name.trim() || !nodes.length) return;
+    setSaving(true);
+    try {
+      await api(`/api/workflows/${detail.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ name: name.trim(), description, nodes, edges }),
+      });
+      await loadWorkflow(detail.id);
+      await loadWorkflows(detail.id);
+      setNotice("工作流已保存为新版本");
+    } catch (cause) {
+      onError(cause instanceof Error ? cause.message : "工作流保存失败");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  /** 暂停、恢复或终止工作流定义，只控制未来触发而不修改既有运行。 */
+  async function controlWorkflow(action: "pause" | "resume" | "terminate") {
+    // 终止不可恢复，因此提交前要求 Human 明确确认。
+    if (!detail || (action === "terminate" && !window.confirm("确认终止该工作流？终止后不可恢复。"))) return;
+    try {
+      await api(`/api/workflows/${detail.id}/${action}`, { method: "POST", body: "{}" });
+      await loadWorkflow(detail.id);
+      await loadWorkflows(detail.id);
+      setNotice(action === "pause" ? "工作流已暂停" : action === "resume" ? "工作流已恢复" : "工作流已终止");
+    } catch (cause) {
+      onError(cause instanceof Error ? cause.message : "工作流控制失败");
+    }
+  }
+
+  /** 清空调度编辑器并恢复默认时区和规则类型。 */
+  function resetScheduleForm() {
+    // 编辑完成或取消后不保留旧规则，避免后续新增误覆盖原调度。
+    setEditingScheduleId("");
+    setScheduleType("periodic");
+    setScheduleExpression("");
+    setScheduleRule("{}");
+    setScheduleTimezone("Asia/Shanghai");
+    setScheduleNextRunAt("");
+  }
+
+  /** 将已有调度加载到表单以执行显式编辑。 */
+  function editSchedule(schedule: WorkflowSchedule) {
+    // 时间输入使用浏览器本地格式，仅展示精确到分钟的预定时间。
+    setEditingScheduleId(schedule.id);
+    setScheduleType(schedule.schedule_type);
+    setScheduleExpression(schedule.schedule_expression);
+    setScheduleRule(JSON.stringify(schedule.parsed_rule, null, 2));
+    setScheduleTimezone(schedule.timezone);
+    setScheduleNextRunAt(schedule.next_run_at ? schedule.next_run_at.slice(0, 16) : "");
+  }
+
+  /** 新建或更新周期、预定时间和 AI 解析调度。 */
+  async function saveSchedule() {
+    // 所有调度都要求可读表达式，AI 解析类型还必须提供合法的非空结构化规则。
+    if (!detail || !scheduleExpression.trim()) return;
+    let parsedRule: Record<string, unknown> = {};
+    try {
+      const parsed = JSON.parse(scheduleRule || "{}") as unknown;
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error("规则必须是 JSON 对象");
+      parsedRule = parsed as Record<string, unknown>;
+      if (scheduleType === "ai_parsed" && !Object.keys(parsedRule).length) throw new Error("AI 解析规则不能为空");
+    } catch (cause) {
+      onError(cause instanceof Error ? cause.message : "结构化规则格式错误");
+      return;
+    }
+
+    // 预定时间转为 ISO 字符串，周期规则没有明确下次时间时交由后端调度器计算。
+    const body = {
+      schedule_type: scheduleType,
+      schedule_expression: scheduleExpression.trim(),
+      parsed_rule: parsedRule,
+      timezone: scheduleTimezone.trim() || "Asia/Shanghai",
+      next_run_at: scheduleNextRunAt ? new Date(scheduleNextRunAt).toISOString() : undefined,
+      ...(editingScheduleId ? {} : { enabled: false }),
+    };
+    try {
+      const path = editingScheduleId ? `/api/workflow-schedules/${editingScheduleId}` : `/api/workflows/${detail.id}/schedules`;
+      await api(path, { method: editingScheduleId ? "PATCH" : "POST", body: JSON.stringify(body) });
+      resetScheduleForm();
+      await loadWorkflow(detail.id);
+      setNotice(editingScheduleId ? "调度已更新" : "调度已创建，默认未启用");
+    } catch (cause) {
+      onError(cause instanceof Error ? cause.message : "调度保存失败");
+    }
+  }
+
+  /** 显式启用或停用一条调度规则。 */
+  async function toggleSchedule(schedule: WorkflowSchedule) {
+    // 启停不修改表达式和下次执行时间，便于后续原样恢复。
+    if (!detail) return;
+    try {
+      await api(`/api/workflow-schedules/${schedule.id}/${schedule.enabled ? "disable" : "enable"}`, { method: "POST", body: "{}" });
+      await loadWorkflow(detail.id);
+    } catch (cause) {
+      onError(cause instanceof Error ? cause.message : "调度状态更新失败");
+    }
+  }
+
+  /** 删除一条尚未需要保留历史的调度配置。 */
+  async function removeSchedule(schedule: WorkflowSchedule) {
+    // 删除不会影响已经产生的运行记录，但仍要求 Human 明确确认目标。
+    if (!detail || !window.confirm(`删除调度“${schedule.schedule_expression}”？`)) return;
+    try {
+      await api(`/api/workflow-schedules/${schedule.id}`, { method: "DELETE" });
+      if (editingScheduleId === schedule.id) resetScheduleForm();
+      await loadWorkflow(detail.id);
+    } catch (cause) {
+      onError(cause instanceof Error ? cause.message : "调度删除失败");
+    }
+  }
+
+  /** 向画布添加一种业务节点，并使用稳定坐标避免布局跳动。 */
+  function addNode(type: WorkflowNodeType) {
+    // 开始和结束节点只允许各存在一个，避免生成无法解释的多入口或多终点骨架。
+    if ((type === "start" || type === "end") && nodes.some((node) => node.type === type)) return;
+    const sequence = nodes.length + 1;
+    const id = `${type}-${Date.now().toString(36)}`;
+    const node: WorkflowNode = {
+      id,
+      type,
+      label: type === "execute" ? `执行步骤 ${sequence}` : workflowNodeLabels[type],
+      config: {},
+      x: 72 + ((sequence - 1) % 3) * 230,
+      y: 72 + Math.floor((sequence - 1) / 3) * 150,
+    };
+    setNodes((current) => [...current, node]);
+    setSelectedNodeId(id);
+  }
+
+  /** 在拖动结束时把节点位置换算为画布内坐标。 */
+  function moveNode(nodeId: string, clientX: number, clientY: number) {
+    // 坐标约束给节点保留完整可见区域，并避免拖到画布负坐标。
+    const bounds = canvasRef.current?.getBoundingClientRect();
+    if (!bounds) return;
+    const x = Math.max(12, Math.min(bounds.width - 184, clientX - bounds.left - 84));
+    const y = Math.max(12, Math.min(bounds.height - 92, clientY - bounds.top - 40));
+    setNodes((current) => current.map((node) => (node.id === nodeId ? { ...node, x, y } : node)));
+  }
+
+  /** 选择连线起点或完成一条连接，判断节点强制写入是/否标签。 */
+  function connectNode(nodeId: string) {
+    // 未进入连线模式时，普通点击只切换节点检查器。
+    if (!connectionSourceId) {
+      setSelectedNodeId(nodeId);
+      return;
+    }
+    if (connectionSourceId === nodeId) {
+      setConnectionSourceId("");
+      return;
+    }
+
+    // 相同起止节点只保留一条边；判断节点允许通过不同标签形成两条明确分支。
+    const source = nodes.find((node) => node.id === connectionSourceId);
+    const label = source?.type === "condition" ? branchLabel : "";
+    const duplicate = edges.some((edge) => edge.source === connectionSourceId && edge.target === nodeId && edge.label === label);
+    if (!duplicate) {
+      setEdges((current) => [
+        ...current,
+        { id: `edge-${Date.now().toString(36)}`, source: connectionSourceId, target: nodeId, label, condition: label ? { branch: label } : {} },
+      ]);
+    }
+    setConnectionSourceId("");
+  }
+
+  /** 删除选中节点以及引用该节点的全部连线。 */
+  function removeSelectedNode() {
+    // 开始和结束节点属于可运行画布的基本边界，不允许从检查器删除。
+    if (!selectedNode || selectedNode.type === "start" || selectedNode.type === "end") return;
+    setNodes((current) => current.filter((node) => node.id !== selectedNode.id));
+    setEdges((current) => current.filter((edge) => edge.source !== selectedNode.id && edge.target !== selectedNode.id));
+    setSelectedNodeId("");
+  }
+
+  /** 更新选中节点的标题或自然语言执行说明。 */
+  function updateSelectedNode(patch: Partial<WorkflowNode>) {
+    // 节点主键和类型不可在检查器中改写，避免已有连线失效。
+    if (!selectedNode) return;
+    setNodes((current) => current.map((node) => (node.id === selectedNode.id ? { ...node, ...patch } : node)));
+  }
+
+  /** 使用当前已保存版本创建一次手动运行。 */
+  async function startRun() {
+    // 运行固定服务端当前版本，本地尚未保存的画布不会混入执行记录。
+    if (!detail) return;
+    try {
+      const created = await api<WorkflowRun>(`/api/workflows/${detail.id}/runs`, { method: "POST", body: JSON.stringify({ input: {} }) });
+      await loadWorkflow(detail.id);
+      setSelectedRunId(created.id);
+      setActivePane("runs");
+      setNotice("运行已进入队列");
+    } catch (cause) {
+      onError(cause instanceof Error ? cause.message : "工作流运行失败");
+    }
+  }
+
+  /** 暂停、恢复或终止当前运行，并刷新运行列表与事件详情。 */
+  async function controlRun(action: "pause" | "resume" | "terminate") {
+    // 终止前进行显式确认，暂停和恢复保持可逆并直接提交。
+    if (!detail || !runDetail || (action === "terminate" && !window.confirm("确认终止本次运行？"))) return;
+    try {
+      await api(`/api/workflow-runs/${runDetail.id}/${action}`, { method: "POST", body: "{}" });
+      await loadWorkflow(detail.id);
+      await loadRun(runDetail.id);
+    } catch (cause) {
+      onError(cause instanceof Error ? cause.message : "运行控制失败");
+    }
+  }
+
+  /** 提交人工确认的布尔决定和评论，并继续读取该运行的最新事实。 */
+  async function resolveApproval(approval: WorkflowApproval, decision: boolean) {
+    // 评论可为空，但决定只能通过显式的通过或否决按钮产生。
+    if (!detail || !runDetail || approval.status !== "pending") return;
+    try {
+      await api(`/api/approval-requests/${approval.id}/resolve`, {
+        method: "POST",
+        body: JSON.stringify({ decision, comment: approvalComments[approval.id] ?? "" }),
+      });
+      setApprovalComments((current) => ({ ...current, [approval.id]: "" }));
+      await loadWorkflow(detail.id);
+      await loadRun(runDetail.id);
+      setNotice(decision ? "人工确认已通过" : "人工确认已否决");
+    } catch (cause) {
+      onError(cause instanceof Error ? cause.message : "人工确认提交失败");
+    }
+  }
+
+  /** 根据事件名称提取节点执行态，兼容 Runner 后续追加更细事件。 */
+  function nodeRunStatus(nodeId: string): string {
+    // 同一节点取最后一条事件，事件命名未匹配时保持等待状态。
+    const event = [...(runDetail?.events ?? [])].reverse().find((item) => item.node_key === nodeId);
+    if (!event) return "等待";
+    if (event.event_type.includes("failed")) return "失败";
+    if (event.event_type.includes("completed") || event.event_type.includes("finished")) return "完成";
+    if (event.event_type.includes("waiting") || event.event_type.includes("confirm")) return "待确认";
+    if (event.event_type.includes("started") || event.event_type.includes("running")) return "执行中";
+    return event.event_type;
+  }
+
+  // 画布高度随节点向下扩展，拖动和动态内容不会压缩外围布局。
+  const canvasHeight = Math.max(540, ...nodes.map((node) => node.y + 130));
+
+  return (
+    <section className="view workflow-view">
+      <aside className="panel workflow-list-panel">
+        <div className="panel-head">
+          <div>
+            <small>{project.name}</small>
+            <h3>工作流</h3>
+          </div>
+          <button className="icon-action" title="新建工作流" aria-label="新建工作流" onClick={() => void createWorkflow()}>＋</button>
+        </div>
+        <div className="workflow-list">
+          {workflows.map((workflow) => (
+            <button key={workflow.id} className={workflow.id === selectedId ? "workflow-row active" : "workflow-row"} onClick={() => setSelectedId(workflow.id)}>
+              <span><b>{workflow.name}</b><small>v{workflow.current_version_no} · {workflow.status}</small></span>
+              <span className="workflow-status-dot" />
+            </button>
+          ))}
+          {!workflows.length && <p className="muted empty-state">暂无工作流</p>}
+        </div>
+      </aside>
+      <main className="panel workflow-main-panel">
+        {detail ? (
+          <>
+            <div className="workflow-titlebar">
+              <div className="workflow-title-fields">
+                <input aria-label="工作流名称" value={name} onChange={(event) => setName(event.target.value)} />
+                <input aria-label="工作流说明" placeholder="工作流说明" value={description} onChange={(event) => setDescription(event.target.value)} />
+              </div>
+              <div className="workflow-title-actions">
+                <div className="segmented-control" aria-label="工作流视图">
+                  <button className={activePane === "canvas" ? "active" : ""} onClick={() => setActivePane("canvas")}>画布</button>
+                  <button className={activePane === "schedules" ? "active" : ""} onClick={() => setActivePane("schedules")}>调度 {schedules.length}</button>
+                  <button className={activePane === "runs" ? "active" : ""} onClick={() => setActivePane("runs")}>运行 {runs.length}</button>
+                </div>
+                {detail.status === "active" && (
+                  <button className="icon-action" title="暂停自动化" aria-label="暂停自动化" onClick={() => void controlWorkflow("pause")}>Ⅱ</button>
+                )}
+                {detail.status === "paused" && (
+                  <button className="icon-action" title="恢复自动化" aria-label="恢复自动化" onClick={() => void controlWorkflow("resume")}>▶</button>
+                )}
+                {detail.status !== "terminated" && (
+                  <button className="danger-action" title="终止自动化" aria-label="终止自动化" onClick={() => void controlWorkflow("terminate")}>■</button>
+                )}
+                <button
+                  className="icon-action"
+                  title="运行工作流"
+                  aria-label="运行工作流"
+                  disabled={detail.status !== "active"}
+                  onClick={() => void startRun()}
+                >
+                  ▷
+                </button>
+                <button className="primary-action" disabled={saving || detail.status === "terminated"} onClick={() => void saveWorkflow()}>
+                  {saving ? "保存中" : "保存"}
+                </button>
+              </div>
+            </div>
+            {notice && <div className="notice-bar">{notice}</div>}
+            {activePane === "canvas" ? (
+              <div className="workflow-editor">
+                <div className="workflow-toolbox">
+                  {(Object.keys(workflowNodeLabels) as WorkflowNodeType[]).map((type) => (
+                    <button key={type} title={`添加${workflowNodeLabels[type]}节点`} onClick={() => addNode(type)}>
+                      <span>{workflowNodeIcons[type]}</span>{workflowNodeLabels[type]}
+                    </button>
+                  ))}
+                  <span className="toolbox-divider" />
+                  <button
+                    className={connectionSourceId ? "active" : ""}
+                    title={selectedNodeId ? "从选中节点开始连线" : "先选择一个节点"}
+                    disabled={!selectedNodeId}
+                    onClick={() => setConnectionSourceId((current) => (current ? "" : selectedNodeId))}
+                  >
+                    <span>↗</span>连线
+                  </button>
+                  {connectionSourceId && nodes.find((node) => node.id === connectionSourceId)?.type === "condition" && (
+                    <div className="branch-control" aria-label="判断分支">
+                      <button className={branchLabel === "是" ? "active" : ""} onClick={() => setBranchLabel("是")}>是</button>
+                      <button className={branchLabel === "否" ? "active" : ""} onClick={() => setBranchLabel("否")}>否</button>
+                    </div>
+                  )}
+                </div>
+                <div className="workflow-canvas-scroll">
+                  <div ref={canvasRef} className={connectionSourceId ? "workflow-canvas connecting" : "workflow-canvas"} style={{ height: canvasHeight }}>
+                    <svg className="workflow-edges" width="100%" height={canvasHeight} aria-hidden="true">
+                      <defs>
+                        <marker id="workflow-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                          <path d="M 0 0 L 10 5 L 0 10 z" />
+                        </marker>
+                      </defs>
+                      {edges.map((edge) => {
+                        const source = nodes.find((node) => node.id === edge.source);
+                        const target = nodes.find((node) => node.id === edge.target);
+                        if (!source || !target) return null;
+                        const forward = target.x >= source.x;
+                        const x1 = forward ? source.x + 168 : source.x;
+                        const y1 = source.y + 40;
+                        const x2 = forward ? target.x : target.x + 168;
+                        const y2 = target.y + 40;
+                        const controlOffset = forward ? 70 : -70;
+                        return (
+                          <g key={edge.id} className="workflow-edge">
+                            <path
+                              d={`M ${x1} ${y1} C ${x1 + controlOffset} ${y1}, ${x2 - controlOffset} ${y2}, ${x2} ${y2}`}
+                              markerEnd="url(#workflow-arrow)"
+                            />
+                            {edge.label && <text x={(x1 + x2) / 2} y={(y1 + y2) / 2 - 7}>{edge.label}</text>}
+                            <circle
+                              cx={(x1 + x2) / 2}
+                              cy={(y1 + y2) / 2 + 8}
+                              r="8"
+                              onClick={() => setEdges((current) => current.filter((item) => item.id !== edge.id))}
+                            />
+                            <text
+                              className="edge-remove"
+                              x={(x1 + x2) / 2}
+                              y={(y1 + y2) / 2 + 11}
+                              onClick={() => setEdges((current) => current.filter((item) => item.id !== edge.id))}
+                            >
+                              ×
+                            </text>
+                          </g>
+                        );
+                      })}
+                    </svg>
+                    {nodes.map((node) => (
+                      <button
+                        key={node.id}
+                        className={
+                          `workflow-node node-${node.type} ${node.id === selectedNodeId ? "selected" : ""} ` +
+                          `${node.id === connectionSourceId ? "connection-source" : ""}`
+                        }
+                        style={{ left: node.x, top: node.y }}
+                        draggable
+                        onDragEnd={(event) => moveNode(node.id, event.clientX, event.clientY)}
+                        onClick={() => connectNode(node.id)}
+                      >
+                        <span className="workflow-node-icon">{workflowNodeIcons[node.type]}</span>
+                        <span><small>{workflowNodeLabels[node.type]}</small><b>{node.label}</b></span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <aside className="node-inspector">
+                  <div className="panel-head"><h3>节点</h3>{selectedNode && <small>{selectedNode.id}</small>}</div>
+                  {selectedNode ? (
+                    <div className="node-fields">
+                      <label>类型<input value={workflowNodeLabels[selectedNode.type]} disabled /></label>
+                      <label>名称<input value={selectedNode.label} onChange={(event) => updateSelectedNode({ label: event.target.value })} /></label>
+                      <label>
+                        节点说明
+                        <textarea
+                          value={String(selectedNode.config.instruction ?? "")}
+                          onChange={(event) => updateSelectedNode({ config: { ...selectedNode.config, instruction: event.target.value } })}
+                        />
+                      </label>
+                      <button
+                        className="danger-action"
+                        disabled={selectedNode.type === "start" || selectedNode.type === "end"}
+                        onClick={removeSelectedNode}
+                      >
+                        删除节点
+                      </button>
+                    </div>
+                  ) : <p className="muted empty-state">选择节点</p>}
+                </aside>
+              </div>
+            ) : activePane === "schedules" ? (
+              <div className="workflow-schedules-layout">
+                <aside className="schedule-form-panel">
+                  <div className="panel-head">
+                    <div><small>{editingScheduleId ? "修改现有规则" : "新触发规则"}</small><h3>{editingScheduleId ? "编辑调度" : "新建调度"}</h3></div>
+                    {editingScheduleId && <button className="icon-action" title="取消编辑" onClick={resetScheduleForm}>×</button>}
+                  </div>
+                  <div className="schedule-form">
+                    <label>
+                      类型
+                      <select value={scheduleType} onChange={(event) => setScheduleType(event.target.value as WorkflowSchedule["schedule_type"])}>
+                        <option value="periodic">周期性重复</option>
+                        <option value="scheduled">预定时间</option>
+                        <option value="ai_parsed">AI 解析规则</option>
+                      </select>
+                    </label>
+                    <label>
+                      规则描述
+                      <textarea
+                        value={scheduleExpression}
+                        onChange={(event) => setScheduleExpression(event.target.value)}
+                        placeholder={
+                          scheduleType === "periodic"
+                            ? "例如：每周一 09:00"
+                            : scheduleType === "scheduled" ? "例如：2026-08-20 14:30" : "例如：每个工作日下班前执行"
+                        }
+                      />
+                    </label>
+                    <label>
+                      时区
+                      <input value={scheduleTimezone} onChange={(event) => setScheduleTimezone(event.target.value)} />
+                    </label>
+                    <label>
+                      下次执行时间
+                      <input type="datetime-local" value={scheduleNextRunAt} onChange={(event) => setScheduleNextRunAt(event.target.value)} />
+                    </label>
+                    <label>
+                      结构化规则 JSON
+                      <textarea className="schedule-rule-input" value={scheduleRule} onChange={(event) => setScheduleRule(event.target.value)} />
+                    </label>
+                    <button className="primary-action" disabled={!scheduleExpression.trim() || detail.status === "terminated"} onClick={() => void saveSchedule()}>
+                      {editingScheduleId ? "保存修改" : "创建调度"}
+                    </button>
+                  </div>
+                </aside>
+                <div className="schedule-list-panel">
+                  <div className="panel-head"><div><small>按工作流保存</small><h3>调度规则</h3></div><span className="count">{schedules.length}</span></div>
+                  <div className="schedule-list">
+                    {schedules.map((schedule) => (
+                      <article className="schedule-card" key={schedule.id}>
+                        <div className="schedule-card-head">
+                          <span><small>{schedule.schedule_type} · {schedule.timezone}</small><b>{schedule.schedule_expression}</b></span>
+                          <span className={schedule.enabled ? "schedule-enabled" : "schedule-disabled"}>{schedule.enabled ? "已启用" : "未启用"}</span>
+                        </div>
+                        <div className="schedule-facts">
+                          <small>下次执行：{schedule.next_run_at ? new Date(schedule.next_run_at).toLocaleString() : "等待调度器计算"}</small>
+                          <pre>{JSON.stringify(schedule.parsed_rule, null, 2)}</pre>
+                        </div>
+                        <div className="schedule-actions">
+                          <button title="编辑调度" onClick={() => editSchedule(schedule)}>编辑</button>
+                          <button title={schedule.enabled ? "停用调度" : "启用调度"} onClick={() => void toggleSchedule(schedule)}>
+                            {schedule.enabled ? "停用" : "启用"}
+                          </button>
+                          <button className="danger-action" title="删除调度" onClick={() => void removeSchedule(schedule)}>删除</button>
+                        </div>
+                      </article>
+                    ))}
+                    {!schedules.length && <p className="muted empty-state">暂无调度规则</p>}
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div className="workflow-runs-layout">
+                <aside className="workflow-run-list">
+                  {runs.map((run) => (
+                    <button key={run.id} className={run.id === selectedRunId ? "workflow-run-row active" : "workflow-run-row"} onClick={() => setSelectedRunId(run.id)}>
+                      <span><b>{run.status}</b><small>{new Date(run.created_at).toLocaleString()}</small></span>
+                      <small>{run.trigger_type}</small>
+                    </button>
+                  ))}
+                  {!runs.length && <p className="muted empty-state">暂无运行记录</p>}
+                </aside>
+                <div className="workflow-run-detail">
+                  {runDetail ? (
+                    <>
+                      <div className="run-detail-head">
+                        <div><small>{runDetail.id}</small><h2>{runDetail.status}</h2></div>
+                        <div className="run-controls">
+                          {(runDetail.status === "queued" || runDetail.status === "running" || runDetail.status === "waiting_child") && (
+                            <button title="暂停" aria-label="暂停" onClick={() => void controlRun("pause")}>Ⅱ</button>
+                          )}
+                          {runDetail.status === "paused" && <button title="恢复" aria-label="恢复" onClick={() => void controlRun("resume")}>▶</button>}
+                          {["queued", "running", "waiting_child", "paused"].includes(runDetail.status) && (
+                            <button className="danger-action" title="终止" aria-label="终止" onClick={() => void controlRun("terminate")}>■</button>
+                          )}
+                          <button title="刷新" aria-label="刷新" onClick={() => void loadRun(runDetail.id)}>↻</button>
+                        </div>
+                      </div>
+                      {!!approvals.length && (
+                        <section className="run-approvals">
+                          <div className="subsection-head"><h3>人工确认</h3><span className="count">{approvals.length}</span></div>
+                          {approvals.map((approval) => (
+                            <article className={approval.status === "pending" ? "approval-card pending" : "approval-card"} key={approval.id}>
+                              <div className="approval-head">
+                                <span><small>{approval.request_type}</small><b>{approval.prompt}</b></span>
+                                <span className="approval-status">{approval.status === "pending" ? "待确认" : "已处理"}</span>
+                              </div>
+                              {approval.status === "pending" ? (
+                                <>
+                                  <textarea
+                                    value={approvalComments[approval.id] ?? ""}
+                                    onChange={(event) => setApprovalComments((current) => ({ ...current, [approval.id]: event.target.value }))}
+                                    placeholder="填写确认意见或补充说明"
+                                  />
+                                  <div className="approval-actions">
+                                    <button className="danger-action" onClick={() => void resolveApproval(approval, false)}>否决</button>
+                                    <button className="primary-action" onClick={() => void resolveApproval(approval, true)}>通过</button>
+                                  </div>
+                                </>
+                              ) : (
+                                <div className="approval-response">
+                                  <small>
+                                    {approval.resolved_by ?? "human"} · {approval.resolved_at ? new Date(approval.resolved_at).toLocaleString() : "已处理"}
+                                  </small>
+                                  <pre>{JSON.stringify(approval.response_data, null, 2)}</pre>
+                                </div>
+                              )}
+                            </article>
+                          ))}
+                        </section>
+                      )}
+                      <div className="run-node-grid">
+                        {nodes.map((node) => (
+                          <div className="run-node-card" key={node.id}>
+                            <span className={`run-state state-${nodeRunStatus(node.id)}`}>{nodeRunStatus(node.id)}</span>
+                            <small>{workflowNodeLabels[node.type]}</small>
+                            <b>{node.label}</b>
+                            {(runDetail.events ?? []).filter((event) => event.node_key === node.id).map((event) => (
+                              <div className="run-event-output" key={event.id}><small>{event.event_type}</small><pre>{JSON.stringify(event.payload, null, 2)}</pre></div>
+                            ))}
+                          </div>
+                        ))}
+                      </div>
+                      {!!outputs.length && (
+                        <section className="run-outputs">
+                          <div className="subsection-head"><h3>执行输出</h3><span className="count">{outputs.length}</span></div>
+                          <div className="run-output-list">
+                            {outputs.map((output) => (
+                              <article className="run-output-card" key={output.id}>
+                                <div>
+                                  <b>{output.output_type}</b>
+                                  <small>
+                                    {output.node_run_id
+                                      ? `节点 ${output.node_run_id}`
+                                      : output.task_id ? `任务 ${output.task_id}` : `作业 ${output.job_id}`}
+                                  </small>
+                                </div>
+                                <pre>{output.content}</pre>
+                                <small>{new Date(output.created_at).toLocaleString()}</small>
+                              </article>
+                            ))}
+                          </div>
+                        </section>
+                      )}
+                      {(runDetail.output != null || runDetail.error_message) && (
+                        <div className="run-final-output">
+                          <h3>{runDetail.error_message ? "错误" : "运行输出"}</h3>
+                          <pre>{runDetail.error_message ?? JSON.stringify(runDetail.output, null, 2)}</pre>
+                        </div>
+                      )}
+                      <div className="run-timeline">
+                        {runDetail.events.map((event) => (
+                          <div className="run-timeline-row" key={event.id}>
+                            <span />
+                            <div><b>{event.event_type}</b><small>{event.node_key ?? "运行"} · {new Date(event.created_at).toLocaleString()}</small></div>
+                          </div>
+                        ))}
+                      </div>
+                    </>
+                  ) : <p className="muted empty-state">选择运行记录</p>}
+                </div>
+              </div>
+            )}
+          </>
+        ) : <p className="muted empty-state">新建或选择工作流</p>}
+      </main>
     </section>
   );
 }

@@ -54,34 +54,67 @@ pub struct CodexRunOutput {
 impl CodexConfig {
     /// 从环境变量加载配置，并拒绝不支持的执行模式。
     pub fn from_env() -> Result<Self, String> {
-        let executable = env::var("CODEX_BIN").unwrap_or_else(|_| "/usr/local/bin/codex".to_owned());
-        let mode = match env::var("CODEX_EXECUTION_MODE").unwrap_or_else(|_| "controlled".to_owned()).as_str() {
+        let executable =
+            env::var("CODEX_BIN").unwrap_or_else(|_| "/usr/local/bin/codex".to_owned());
+        let mode = match env::var("CODEX_EXECUTION_MODE")
+            .unwrap_or_else(|_| "controlled".to_owned())
+            .as_str()
+        {
             "controlled" => ExecutionMode::Controlled,
             "real" => ExecutionMode::Real,
             value => return Err(format!("unsupported CODEX_EXECUTION_MODE: {value}")),
         };
-        let workspace_root = env::var("XIEXU_WORKSPACE_ROOT").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/workspace"));
+        let workspace_root = env::var("XIEXU_WORKSPACE_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/workspace"));
         if !workspace_root.is_absolute() {
             return Err("XIEXU_WORKSPACE_ROOT must be absolute".to_owned());
         }
-        let max_run_seconds = env::var("CODEX_MAX_RUN_SECONDS").ok().and_then(|value| value.parse::<u64>().ok()).unwrap_or(1_800).clamp(30, 3_600);
-        Ok(Self { executable: PathBuf::from(executable), mode, workspace_root, max_run_seconds })
+        let max_run_seconds = env::var("CODEX_MAX_RUN_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(1_800)
+            .clamp(30, 3_600);
+        Ok(Self {
+            executable: PathBuf::from(executable),
+            mode,
+            workspace_root,
+            max_run_seconds,
+        })
     }
 
     /// 返回当前是否启用真实 CLI 执行。
-    pub fn is_real(&self) -> bool { self.mode == ExecutionMode::Real }
+    pub fn is_real(&self) -> bool {
+        self.mode == ExecutionMode::Real
+    }
 
     /// 返回可用于日志和状态接口的稳定模式名称。
-    pub fn mode_name(&self) -> &'static str { if self.is_real() { "real" } else { "controlled" } }
+    pub fn mode_name(&self) -> &'static str {
+        if self.is_real() {
+            "real"
+        } else {
+            "controlled"
+        }
+    }
 
     /// 返回覆盖最长运行时间的数据库租约秒数。
-    pub fn lease_seconds(&self) -> i32 { (self.max_run_seconds + 60) as i32 }
+    pub fn lease_seconds(&self) -> i32 {
+        (self.max_run_seconds + 60) as i32
+    }
 
     /// 在受管项目工作区内运行 Codex，并解析 JSONL 最终结果。
-    pub async fn run(&self, kind: &str, context: TaskPromptContext<'_>) -> Result<CodexRunOutput, String> {
+    pub async fn run(
+        &self,
+        kind: &str,
+        context: TaskPromptContext<'_>,
+    ) -> Result<CodexRunOutput, String> {
         let workspace = self.prepare_workspace(context.project_id).await?;
         let prompt = build_prompt(kind, &context)?;
-        let sandbox = if kind == "execute_task" { "workspace-write" } else { "read-only" };
+        let sandbox = if kind == "execute_task" {
+            "workspace-write"
+        } else {
+            "read-only"
+        };
 
         // 以非交互模式启动 Codex，排除敏感环境进入模型生成的 Shell 子进程。
         let mut command = Command::new(&self.executable);
@@ -104,18 +137,29 @@ impl CodexConfig {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        let output = timeout(Duration::from_secs(self.max_run_seconds), command.output()).await.map_err(|_| format!("Codex run exceeded {} seconds", self.max_run_seconds))?.map_err(|error| format!("failed to start Codex: {error}"))?;
+        let output = timeout(Duration::from_secs(self.max_run_seconds), command.output())
+            .await
+            .map_err(|_| format!("Codex run exceeded {} seconds", self.max_run_seconds))?
+            .map_err(|error| format!("failed to start Codex: {error}"))?;
         parse_output(output.status.success(), &output.stdout, &output.stderr)
     }
 
     /// 创建并校验项目工作区，防止符号链接或异常 ID 逃逸允许根目录。
     async fn prepare_workspace(&self, project_id: &str) -> Result<PathBuf, String> {
         Uuid::parse_str(project_id).map_err(|_| "project_id must be a UUID".to_owned())?;
-        tokio::fs::create_dir_all(&self.workspace_root).await.map_err(|error| format!("cannot create workspace root: {error}"))?;
-        let canonical_root = tokio::fs::canonicalize(&self.workspace_root).await.map_err(|error| format!("cannot resolve workspace root: {error}"))?;
+        tokio::fs::create_dir_all(&self.workspace_root)
+            .await
+            .map_err(|error| format!("cannot create workspace root: {error}"))?;
+        let canonical_root = tokio::fs::canonicalize(&self.workspace_root)
+            .await
+            .map_err(|error| format!("cannot resolve workspace root: {error}"))?;
         let project_dir = canonical_root.join("projects").join(project_id);
-        tokio::fs::create_dir_all(&project_dir).await.map_err(|error| format!("cannot create project workspace: {error}"))?;
-        let canonical_project = tokio::fs::canonicalize(&project_dir).await.map_err(|error| format!("cannot resolve project workspace: {error}"))?;
+        tokio::fs::create_dir_all(&project_dir)
+            .await
+            .map_err(|error| format!("cannot create project workspace: {error}"))?;
+        let canonical_project = tokio::fs::canonicalize(&project_dir)
+            .await
+            .map_err(|error| format!("cannot resolve project workspace: {error}"))?;
         if !canonical_project.starts_with(&canonical_root) {
             return Err("project workspace escapes XIEXU_WORKSPACE_ROOT".to_owned());
         }
@@ -128,7 +172,12 @@ fn build_prompt(kind: &str, context: &TaskPromptContext<'_>) -> Result<String, S
     // 身份、职责和记忆作为清晰分区进入提示，避免与用户任务内容互相覆盖。
     let task = format!(
         "项目：{}\n工作标题：{}\n工作说明：{}\n\n当前 Agent：{}\n职责约束：{}\n\n相关记忆：{}",
-        context.project_name, context.title, context.description, context.agent_name, context.agent_instructions, context.memories
+        context.project_name,
+        context.title,
+        context.description,
+        context.agent_name,
+        context.agent_instructions,
+        context.memories
     );
     match kind {
         "prepare_task_plan" => Ok(format!("你是协序的项目协调 Agent。请只分析当前任务并输出可供 Human 审核的实施方案，不要修改工作区文件。方案应包含目标、步骤、边界、风险和验收方式。\n\n{task}")),
@@ -140,6 +189,13 @@ fn build_prompt(kind: &str, context: &TaskPromptContext<'_>) -> Result<String, S
                 "你是协序的项目协调 Agent。请根据目标章节当前内容、项目其他章节和任务事实，输出目标章节的完整替换候选。",
                 "只输出候选正文，不要添加标题、解释、Markdown 代码块或数据库操作；不得修改工作区文件，",
                 "不得创造输入中不存在的进展或结论。\n\n{task}"
+            ),
+            task = task
+        )),
+        "evaluate_workflow_condition" => Ok(format!(
+            concat!(
+                "你是协序工作流的判断 Agent。只依据给定规则、运行输入和已完成节点输出判断条件是否成立。",
+                "最终消息只能是 yes 或 no，不要解释原因，不要修改工作区文件。\n\n{task}"
             ),
             task = task
         )),
@@ -156,21 +212,41 @@ fn parse_output(success: bool, stdout: &[u8], stderr: &[u8]) -> Result<CodexRunO
     for line in stdout.lines() {
         let Ok(event) = serde_json::from_str::<Value>(line) else { continue; };
         match event.get("type").and_then(Value::as_str) {
-            Some("thread.started") => thread_id = event.get("thread_id").and_then(Value::as_str).map(ToOwned::to_owned),
-            Some("item.completed") if event.pointer("/item/type").and_then(Value::as_str) == Some("agent_message") => {
-                final_message = event.pointer("/item/text").and_then(Value::as_str).map(|value| truncate(value, 65_536));
+            Some("thread.started") => {
+                thread_id = event
+                    .get("thread_id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
             }
-            Some("turn.failed") | Some("error") => event_error = event.get("message").and_then(Value::as_str).map(|value| truncate(value, 2_000)),
+            Some("item.completed")
+                if event.pointer("/item/type").and_then(Value::as_str) == Some("agent_message") =>
+            {
+                final_message = event
+                    .pointer("/item/text")
+                    .and_then(Value::as_str)
+                    .map(|value| truncate(value, 65_536));
+            }
+            Some("turn.failed") | Some("error") => {
+                event_error = event
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .map(|value| truncate(value, 2_000))
+            }
             _ => {}
         }
     }
     if !success {
         let stderr = truncate(String::from_utf8_lossy(stderr).trim(), 2_000);
-        return Err(event_error.or_else(|| (!stderr.is_empty()).then_some(stderr)).unwrap_or_else(|| "Codex run failed".to_owned()));
+        return Err(event_error
+            .or_else(|| (!stderr.is_empty()).then_some(stderr))
+            .unwrap_or_else(|| "Codex run failed".to_owned()));
     }
-    let content = final_message.ok_or_else(|| "Codex completed without a final agent message".to_owned())?;
+    let content =
+        final_message.ok_or_else(|| "Codex completed without a final agent message".to_owned())?;
     Ok(CodexRunOutput { content, thread_id })
 }
 
 /// 按字符边界截断外部输出，防止单次运行无限放大数据库记录。
-fn truncate(value: &str, max_chars: usize) -> String { value.chars().take(max_chars).collect() }
+fn truncate(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
+}

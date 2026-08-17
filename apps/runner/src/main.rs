@@ -1,4 +1,5 @@
 mod codex;
+mod workflow;
 
 use codex::{CodexConfig, TaskPromptContext};
 use serde_json::json;
@@ -81,7 +82,10 @@ async fn main() {
     let runner_name = env::var("RUNNER_NAME").unwrap_or_else(|_| runner_id.clone());
     let codex_config = Arc::new(CodexConfig::from_env().expect("load Codex runtime configuration"));
     let lease_seconds = codex_config.lease_seconds();
-    println!("xiexu runner {runner_id} starting with Codex mode {}", codex_config.mode_name());
+    println!(
+        "xiexu runner {runner_id} starting with Codex mode {}",
+        codex_config.mode_name()
+    );
 
     // 同一 Runner ID 重启时，旧进程已不存在，主动回收其未完成尝试以避免长租约悬挂。
     if let Err(error) = recover_runner_jobs(&database_url, &runner_id).await {
@@ -92,6 +96,7 @@ async fn main() {
     let mut heartbeat_tick = tokio::time::interval(Duration::from_secs(10));
     let mut claim_tick = tokio::time::interval(Duration::from_secs(2));
     let mut document_refresh_tick = tokio::time::interval(Duration::from_secs(30));
+    let mut workflow_tick = tokio::time::interval(Duration::from_secs(5));
     let mut active_execution: Option<ActiveExecution> = None;
     loop {
         tokio::select! {
@@ -139,6 +144,14 @@ async fn main() {
                     eprintln!("runner project document scan failed: {error}");
                 }
             }
+            _ = workflow_tick.tick() => {
+                if let Err(error) = workflow::scan_workflow_schedules(&database_url).await {
+                    eprintln!("runner workflow schedule scan failed: {error}");
+                }
+                if let Err(error) = workflow::scan_workflow_runs(&database_url).await {
+                    eprintln!("runner workflow scan failed: {error}");
+                }
+            }
         }
     }
 }
@@ -147,16 +160,25 @@ async fn main() {
 async fn recover_runner_jobs(database_url: &str, runner_id: &str) -> Result<(), String> {
     // 尝试和作业状态在一个事务更新，后续领取会生成新的 attempt。
     let mut client = connect(database_url).await?;
-    let transaction = client.transaction().await.map_err(|error| error.to_string())?;
+    let transaction = client
+        .transaction()
+        .await
+        .map_err(|error| error.to_string())?;
     transaction.execute("UPDATE execution_jobs SET status = 'queued', available_at = now(), updated_at = now() WHERE status = 'running' AND attempt_count < max_attempts AND EXISTS (SELECT 1 FROM execution_attempts a WHERE a.job_id = execution_jobs.id AND a.runner_instance_id = $1 AND a.status = 'running')", &[&runner_id]).await.map_err(|error| error.to_string())?;
     transaction.execute("UPDATE execution_attempts SET status = 'expired', finished_at = now(), failure_message = 'runner restarted' WHERE runner_instance_id = $1 AND status = 'running'", &[&runner_id]).await.map_err(|error| error.to_string())?;
-    transaction.commit().await.map_err(|error| error.to_string())
+    transaction
+        .commit()
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// 周期扫描 Todo，按任务 revision 幂等创建方案生成作业。
 async fn scan_todo_tasks(database_url: &str) -> Result<(), String> {
     let mut client = connect(database_url).await?;
-    let transaction = client.transaction().await.map_err(|error| error.to_string())?;
+    let transaction = client
+        .transaction()
+        .await
+        .map_err(|error| error.to_string())?;
 
     // 没有主责的 Todo 任务由项目协调 Agent 保底认领，固定成员与动态参与关系保持分离。
     transaction.execute("INSERT INTO task_agents (task_id, agent_id, participation_type, status) SELECT t.id, pa.agent_id, 'owner', 'active' FROM tasks t JOIN project_agents pa ON pa.project_id = t.project_id AND pa.assignment_type = 'coordinator' AND pa.status = 'active' WHERE t.board_stage = 'todo' AND NOT EXISTS (SELECT 1 FROM task_agents ta WHERE ta.task_id = t.id AND ta.participation_type = 'owner' AND ta.status = 'active') ON CONFLICT (task_id, agent_id) DO UPDATE SET participation_type = 'owner', status = 'active', joined_at = now(), left_at = NULL", &[]).await.map_err(|error| error.to_string())?;
@@ -175,14 +197,20 @@ async fn scan_todo_tasks(database_url: &str) -> Result<(), String> {
             transaction.execute("INSERT INTO task_events (task_id, event_type, actor_type, actor_id, event_data) VALUES ($1, 'execution.plan_queued', 'system', 'runner', $2)", &[&task_id, &json!({ "kind": "prepare_task_plan", "dedupe_key": dedupe_key })]).await.map_err(|error| error.to_string())?;
         }
     }
-    transaction.commit().await.map_err(|error| error.to_string())
+    transaction
+        .commit()
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// 每约三十秒扫描落后于项目任务变更的文档，并按文档 revision 幂等补建刷新作业。
 async fn scan_project_document_refreshes(database_url: &str) -> Result<(), String> {
     // 扫描使用短事务持有文档行锁，排队完成后立即释放，不阻塞实际刷新执行。
     let mut client = connect(database_url).await?;
-    let transaction = client.transaction().await.map_err(|error| error.to_string())?;
+    let transaction = client
+        .transaction()
+        .await
+        .map_err(|error| error.to_string())?;
 
     // 一次批量锁定所有满足条件的文档；活跃作业和文档锁共同避免多 Runner 重复排队。
     let rows = transaction
@@ -233,7 +261,10 @@ async fn scan_project_document_refreshes(database_url: &str) -> Result<(), Strin
     }
 
     // 扫描批次统一提交，保证判重结果和所有新作业同时可见。
-    transaction.commit().await.map_err(|error| error.to_string())
+    transaction
+        .commit()
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// 写入可幂等的实例心跳，租约过期后由控制面将实例视为 stale。
@@ -253,18 +284,28 @@ async fn heartbeat(database_url: &str, runner_id: &str, runner_name: &str) -> Re
 }
 
 /// 为正在运行的 attempt 续租，长时间 Codex 运行不会被其他 Runner 重复领取。
-async fn heartbeat_attempt(database_url: &str, attempt_id: &str, lease_seconds: i32) -> Result<(), String> {
+async fn heartbeat_attempt(
+    database_url: &str,
+    attempt_id: &str,
+    lease_seconds: i32,
+) -> Result<(), String> {
     let client = connect(database_url).await?;
     // 租约秒数已由配置边界限制为正整数，嵌入 SQL 字面量可避免驱动缺少 interval 参数编码器的问题。
     let query = format!(
         "UPDATE execution_attempts SET heartbeat_at = now(), lease_expires_at = now() + interval '{lease_seconds} seconds' WHERE id = $1 AND status = 'running'",
     );
-    client.execute(&query, &[&attempt_id]).await.map(|_| ()).map_err(|error| error.to_string())
+    client
+        .execute(&query, &[&attempt_id])
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 /// 建立短生命周期数据库连接，并把连接任务交给 Tokio 维护。
 async fn connect(database_url: &str) -> Result<Client, String> {
-    let (client, connection) = tokio_postgres::connect(database_url, NoTls).await.map_err(|error| error.to_string())?;
+    let (client, connection) = tokio_postgres::connect(database_url, NoTls)
+        .await
+        .map_err(|error| error.to_string())?;
     tokio::spawn(async move {
         if let Err(error) = connection.await {
             eprintln!("runner database connection ended: {error}");
@@ -274,9 +315,16 @@ async fn connect(database_url: &str) -> Result<Client, String> {
 }
 
 /// 原子领取一个到期可执行作业，并为本次领取建立租约尝试。
-async fn claim_job(database_url: &str, runner_id: &str, lease_seconds: i32) -> Result<Option<ClaimedJob>, String> {
+async fn claim_job(
+    database_url: &str,
+    runner_id: &str,
+    lease_seconds: i32,
+) -> Result<Option<ClaimedJob>, String> {
     let mut client = connect(database_url).await?;
-    let transaction = client.transaction().await.map_err(|error| error.to_string())?;
+    let transaction = client
+        .transaction()
+        .await
+        .map_err(|error| error.to_string())?;
 
     // 先回收已经失去租约的作业，允许其在最大尝试次数内重新排队。
     transaction.execute("UPDATE execution_jobs SET status = 'queued', available_at = now(), updated_at = now() WHERE status = 'running' AND attempt_count < max_attempts AND EXISTS (SELECT 1 FROM execution_attempts a WHERE a.job_id = execution_jobs.id AND a.status = 'running' AND a.lease_expires_at < now())", &[]).await.map_err(|error| error.to_string())?;
@@ -301,7 +349,10 @@ async fn claim_job(database_url: &str, runner_id: &str, lease_seconds: i32) -> R
     let attempt_insert = format!(
         "INSERT INTO execution_attempts (id, job_id, runner_instance_id, status, lease_expires_at) VALUES ($1, $2, $3, 'running', now() + interval '{lease_seconds} seconds')",
     );
-    transaction.execute(&attempt_insert, &[&attempt_id, &job_id, &runner_id]).await.map_err(|error| error.to_string())?;
+    transaction
+        .execute(&attempt_insert, &[&attempt_id, &job_id, &runner_id])
+        .await
+        .map_err(|error| error.to_string())?;
     if kind != "refresh_project_document" {
         if let Some(task_id) = task_id.as_ref() {
             transaction
@@ -311,16 +362,53 @@ async fn claim_job(database_url: &str, runner_id: &str, lease_seconds: i32) -> R
         }
     }
     transaction.execute("INSERT INTO execution_events (job_id, attempt_id, task_id, event_type, payload) VALUES ($1, $2, $3, 'job.claimed', $4)", &[&job_id, &attempt_id, &task_id, &json!({ "runner_id": runner_id })]).await.map_err(|error| error.to_string())?;
-    transaction.commit().await.map_err(|error| error.to_string())?;
-    Ok(Some(ClaimedJob { job_id, kind, task_id, project_id, agent_id, conversation_id, payload, attempt_id }))
+    transaction
+        .commit()
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(Some(ClaimedJob {
+        job_id,
+        kind,
+        task_id,
+        project_id,
+        agent_id,
+        conversation_id,
+        payload,
+        attempt_id,
+    }))
 }
 
 /// 执行白名单作业，真实模式调用 Codex，受控模式保留可验证的本地输出。
-async fn execute_job(database_url: &str, runner_id: &str, mut job: ClaimedJob, codex_config: &CodexConfig) -> Result<(), String> {
+async fn execute_job(
+    database_url: &str,
+    runner_id: &str,
+    mut job: ClaimedJob,
+    codex_config: &CodexConfig,
+) -> Result<(), String> {
     // 先验证作业类型，避免无效请求启动外部进程。
-    let supported = ["execute_task", "prepare_task_plan", "optimize_agent_profile", "summarize_conversation", "refresh_project_document"];
+    let supported = [
+        "execute_task",
+        "prepare_task_plan",
+        "optimize_agent_profile",
+        "summarize_conversation",
+        "refresh_project_document",
+        "run_workflow",
+    ];
     if !supported.contains(&job.kind.as_str()) {
         return mark_failed(database_url, &job, "unsupported execution kind").await;
+    }
+
+    // 工作流由专用状态机分段推进，不把整个画布误当成一次 Codex 调用。
+    if job.kind == "run_workflow" {
+        return match workflow::execute_workflow_job(database_url, runner_id, &mut job, codex_config)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                mark_failed(database_url, &job, &error).await?;
+                Err(error)
+            }
+        };
     }
 
     // 按作业范围加载最小业务上下文，职责和记忆始终由服务端事实源生成。
@@ -360,15 +448,33 @@ async fn execute_job(database_url: &str, runner_id: &str, mut job: ClaimedJob, c
     };
 
     // 兼容 M2 已入队或旧接口创建的任务作业，在执行前补齐项目和 Agent 作用域。
-    if job.project_id.is_none() && job.kind != "optimize_agent_profile" { job.project_id = Some(context.project_id.clone()); }
-    if job.agent_id.is_none() { job.agent_id = context.agent_id.clone(); }
+    if job.project_id.is_none() && job.kind != "optimize_agent_profile" {
+        job.project_id = Some(context.project_id.clone());
+    }
+    if job.agent_id.is_none() {
+        job.agent_id = context.agent_id.clone();
+    }
     let scope_client = connect(database_url).await?;
     scope_client.execute("UPDATE execution_jobs SET project_id = COALESCE(project_id, $2), agent_id = COALESCE(agent_id, $3), updated_at = now() WHERE id = $1", &[&job.job_id, &job.project_id, &job.agent_id]).await.map_err(|error| error.to_string())?;
     mark_attempt_started(database_url, runner_id, &job, codex_config.mode_name()).await?;
 
     // 真实模式只把必要业务字段传给 Codex，数据库配置和其他环境不会进入提示。
     let execution_result = if codex_config.is_real() {
-        codex_config.run(&job.kind, TaskPromptContext { project_id: &context.project_id, project_name: &context.project_name, title: &context.title, description: &context.description, agent_name: &context.agent_name, agent_instructions: &context.agent_instructions, memories: &context.memories }).await.map(|output| (output.content, output.thread_id))
+        codex_config
+            .run(
+                &job.kind,
+                TaskPromptContext {
+                    project_id: &context.project_id,
+                    project_name: &context.project_name,
+                    title: &context.title,
+                    description: &context.description,
+                    agent_name: &context.agent_name,
+                    agent_instructions: &context.agent_instructions,
+                    memories: &context.memories,
+                },
+            )
+            .await
+            .map(|output| (output.content, output.thread_id))
     } else {
         let content = match job.kind.as_str() {
             "prepare_task_plan" => "方案草案已生成，等待 Human 确认。",
@@ -389,13 +495,62 @@ async fn execute_job(database_url: &str, runner_id: &str, mut job: ClaimedJob, c
     };
     // 不同作业类型只在完成后的业务状态变化上分支，执行追踪语义保持一致。
     match job.kind.as_str() {
-        "prepare_task_plan" => finish_plan_job(database_url, runner_id, &job, job.task_id.as_deref().expect("validated task id"), &output_content, thread_id.as_deref()).await,
-        "execute_task" => finish_execution_job(database_url, runner_id, &job, job.task_id.as_deref().expect("validated task id"), &output_content, thread_id.as_deref()).await,
-        "optimize_agent_profile" => finish_general_job(database_url, runner_id, &job, "responsibility_draft", &output_content, thread_id.as_deref()).await,
-        "summarize_conversation" => finish_conversation_summary(database_url, runner_id, &job, &output_content, thread_id.as_deref()).await,
+        "prepare_task_plan" => {
+            finish_plan_job(
+                database_url,
+                runner_id,
+                &job,
+                job.task_id.as_deref().expect("validated task id"),
+                &output_content,
+                thread_id.as_deref(),
+            )
+            .await
+        }
+        "execute_task" => {
+            finish_execution_job(
+                database_url,
+                runner_id,
+                &job,
+                job.task_id.as_deref().expect("validated task id"),
+                &output_content,
+                thread_id.as_deref(),
+            )
+            .await
+        }
+        "optimize_agent_profile" => {
+            finish_general_job(
+                database_url,
+                runner_id,
+                &job,
+                "responsibility_draft",
+                &output_content,
+                thread_id.as_deref(),
+            )
+            .await
+        }
+        "summarize_conversation" => {
+            finish_conversation_summary(
+                database_url,
+                runner_id,
+                &job,
+                &output_content,
+                thread_id.as_deref(),
+            )
+            .await
+        }
         "refresh_project_document" => {
-            let refresh_context = document_refresh_context.as_ref().expect("document refresh context exists");
-            finish_document_refresh_job(database_url, runner_id, &job, refresh_context, &output_content, thread_id.as_deref()).await
+            let refresh_context = document_refresh_context
+                .as_ref()
+                .expect("document refresh context exists");
+            finish_document_refresh_job(
+                database_url,
+                runner_id,
+                &job,
+                refresh_context,
+                &output_content,
+                thread_id.as_deref(),
+            )
+            .await
         }
         _ => unreachable!("job kind was validated"),
     }
@@ -411,16 +566,42 @@ async fn load_task_context(database_url: &str, task_id: &str) -> Result<Executio
 
     // 仅加载当前 Agent 的全局记忆和与当前项目、任务相符的记忆，限制数量防止提示无限膨胀。
     let memories = load_memories(&client, &agent_id, Some(&project_id), Some(task_id)).await?;
-    Ok(ExecutionContext { project_id, project_name: row.get(1), title: row.get(2), description: row.get(3), agent_id: Some(agent_id), agent_name: row.get(5), agent_instructions: row.get(6), memories })
+    Ok(ExecutionContext {
+        project_id,
+        project_name: row.get(1),
+        title: row.get(2),
+        description: row.get(3),
+        agent_id: Some(agent_id),
+        agent_name: row.get(5),
+        agent_instructions: row.get(6),
+        memories,
+    })
 }
 
 /// 从作业载荷构造职责优化上下文，已有 Agent 的职责与记忆会作为草案参考。
-async fn load_agent_profile_context(database_url: &str, job: &ClaimedJob) -> Result<ExecutionContext, String> {
+async fn load_agent_profile_context(
+    database_url: &str,
+    job: &ClaimedJob,
+) -> Result<ExecutionContext, String> {
     // 用户输入必须在作业创建时完成校验，Runner 仍以空值保护处理异常历史数据。
     let client = connect(database_url).await?;
-    let name = job.payload.get("name").and_then(serde_json::Value::as_str).unwrap_or("未命名 Agent").to_owned();
-    let description = job.payload.get("description").and_then(serde_json::Value::as_str).unwrap_or("").to_owned();
-    let supplement = job.payload.get("responsibility_supplement").and_then(serde_json::Value::as_str).unwrap_or("");
+    let name = job
+        .payload
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("未命名 Agent")
+        .to_owned();
+    let description = job
+        .payload
+        .get("description")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let supplement = job
+        .payload
+        .get("responsibility_supplement")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
     let mut instructions = supplement.to_owned();
     let mut memories = "无相关记忆".to_owned();
     if let Some(agent_id) = job.agent_id.as_ref() {
@@ -429,11 +610,23 @@ async fn load_agent_profile_context(database_url: &str, job: &ClaimedJob) -> Res
             memories = load_memories(&client, agent_id, None, None).await?;
         }
     }
-    Ok(ExecutionContext { project_id: "00000000-0000-0000-0000-000000000000".to_owned(), project_name: "协序 Agent 身份中心".to_owned(), title: name.clone(), description, agent_id: job.agent_id.clone(), agent_name: name, agent_instructions: instructions, memories })
+    Ok(ExecutionContext {
+        project_id: "00000000-0000-0000-0000-000000000000".to_owned(),
+        project_name: "协序 Agent 身份中心".to_owned(),
+        title: name.clone(),
+        description,
+        agent_id: job.agent_id.clone(),
+        agent_name: name,
+        agent_instructions: instructions,
+        memories,
+    })
 }
 
 /// 将项目临时群聊整理为受控对话总结上下文。
-async fn load_conversation_context(database_url: &str, conversation_id: &str) -> Result<ExecutionContext, String> {
+async fn load_conversation_context(
+    database_url: &str,
+    conversation_id: &str,
+) -> Result<ExecutionContext, String> {
     // 只允许加载属于项目且处于归档中的临时群聊。
     let client = connect(database_url).await?;
     let row = client.query_opt("SELECT p.id, p.name, c.title, a.id, a.name, concat_ws(E'\n', a.instructions, NULLIF(a.responsibility_supplement, ''), NULLIF(pa.responsibility_override, '')) FROM conversations c JOIN projects p ON p.id = c.project_id JOIN project_agents pa ON pa.project_id = p.id AND pa.assignment_type = 'coordinator' AND pa.status = 'active' JOIN agents a ON a.id = pa.agent_id WHERE c.id = $1 AND c.conversation_type = 'project_temporary' AND c.status = 'archiving'", &[&conversation_id]).await.map_err(|error| error.to_string())?.ok_or_else(|| "archiving project conversation not found".to_owned())?;
@@ -442,16 +635,43 @@ async fn load_conversation_context(database_url: &str, conversation_id: &str) ->
 
     // 消息按时间聚合并限制总长度，原始消息仍完整保存在数据库中。
     let messages = client.query("SELECT author_type, author_id, content FROM conversation_messages WHERE conversation_id = $1 ORDER BY created_at, id", &[&conversation_id]).await.map_err(|error| error.to_string())?;
-    let transcript = messages.iter().map(|message| format!("[{}:{}] {}", message.get::<_, String>(0), message.get::<_, String>(1), message.get::<_, String>(2))).collect::<Vec<_>>().join("\n");
+    let transcript = messages
+        .iter()
+        .map(|message| {
+            format!(
+                "[{}:{}] {}",
+                message.get::<_, String>(0),
+                message.get::<_, String>(1),
+                message.get::<_, String>(2)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     let description = transcript.chars().take(60_000).collect::<String>();
     let memories = load_memories(&client, &agent_id, Some(&project_id), None).await?;
-    Ok(ExecutionContext { project_id, project_name: row.get(1), title: row.get(2), description, agent_id: Some(agent_id), agent_name: row.get(4), agent_instructions: row.get(5), memories })
+    Ok(ExecutionContext {
+        project_id,
+        project_name: row.get(1),
+        title: row.get(2),
+        description,
+        agent_id: Some(agent_id),
+        agent_name: row.get(4),
+        agent_instructions: row.get(5),
+        memories,
+    })
 }
 
 /// 加载项目、目标章节、任务快照与协调 Agent，生成文档刷新所需的完整事实上下文。
-async fn load_project_document_context(database_url: &str, job: &ClaimedJob) -> Result<DocumentRefreshContext, String> {
+async fn load_project_document_context(
+    database_url: &str,
+    job: &ClaimedJob,
+) -> Result<DocumentRefreshContext, String> {
     // 文档身份必须来自受控 payload，并且在作业声明项目时必须属于同一项目。
-    let document_id = job.payload.get("document_id").and_then(serde_json::Value::as_str).ok_or_else(|| "document refresh requires document_id".to_owned())?;
+    let document_id = job
+        .payload
+        .get("document_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "document refresh requires document_id".to_owned())?;
     let client = connect(database_url).await?;
     let row = client
         .query_opt(
@@ -489,7 +709,11 @@ async fn load_project_document_context(database_url: &str, job: &ClaimedJob) -> 
                 section.get::<_, String>(0),
                 section.get::<_, String>(1),
                 section.get::<_, i64>(4),
-                if section.get::<_, bool>(3) { "，Human 锁定" } else { "" },
+                if section.get::<_, bool>(3) {
+                    "，Human 锁定"
+                } else {
+                    ""
+                },
                 section.get::<_, String>(2)
             )
         })
@@ -497,12 +721,15 @@ async fn load_project_document_context(database_url: &str, job: &ClaimedJob) -> 
         .join("\n");
 
     // 一次查询取得完整任务快照并标记自上次刷新后的变更，生成候选时不做逐任务访问。
-    let source_task_id = job.payload.get("source_task_id").and_then(serde_json::Value::as_str);
+    let source_task_id = job
+        .payload
+        .get("source_task_id")
+        .and_then(serde_json::Value::as_str);
     let task_rows = client
         .query(
             concat!(
                 "SELECT id, title, board_stage, plan_status, execution_status, acceptance_status, progress_percent, revision, ",
-                "updated_at > COALESCE($2::timestamptz, '-infinity'::timestamptz) OR id = $3, ",
+                "COALESCE(updated_at > COALESCE($2::timestamptz, '-infinity'::timestamptz) OR id = $3, FALSE), ",
                 "to_char(updated_at, 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') FROM tasks ",
                 "WHERE project_id = $1 ORDER BY created_at, id LIMIT 200"
             ),
@@ -528,7 +755,11 @@ async fn load_project_document_context(database_url: &str, job: &ClaimedJob) -> 
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let controlled_candidate = if task_rows.is_empty() { "项目当前尚无任务。".to_owned() } else { format!("项目任务进展：\n{task_snapshot}") };
+    let controlled_candidate = if task_rows.is_empty() {
+        "项目当前尚无任务。".to_owned()
+    } else {
+        format!("项目任务进展：\n{task_snapshot}")
+    };
 
     // 刷新提示显式区分当前章节、其他章节和任务事实，真实模式只能返回目标章节的完整替换候选。
     let description = format!(
@@ -538,14 +769,22 @@ async fn load_project_document_context(database_url: &str, job: &ClaimedJob) -> 
         ),
         row.get::<_, String>(4),
         sections,
-        if task_snapshot.is_empty() { "无任务" } else { &task_snapshot }
+        if task_snapshot.is_empty() {
+            "无任务"
+        } else {
+            &task_snapshot
+        }
     );
     let memories = load_memories(&client, &agent_id, Some(&project_id), source_task_id).await?;
     Ok(DocumentRefreshContext {
         execution: ExecutionContext {
             project_id,
             project_name: row.get(1),
-            title: format!("刷新《{}》的{}章节", row.get::<_, String>(2), row.get::<_, String>(3)),
+            title: format!(
+                "刷新《{}》的{}章节",
+                row.get::<_, String>(2),
+                row.get::<_, String>(3)
+            ),
             description,
             agent_id: Some(agent_id),
             agent_name: row.get(6),
@@ -560,62 +799,243 @@ async fn load_project_document_context(database_url: &str, job: &ClaimedJob) -> 
 }
 
 /// 批量加载一个 Agent 在给定项目、任务范围内可用的最近记忆。
-async fn load_memories(client: &Client, agent_id: &str, project_id: Option<&String>, task_id: Option<&str>) -> Result<String, String> {
+async fn load_memories(
+    client: &Client,
+    agent_id: &str,
+    project_id: Option<&String>,
+    task_id: Option<&str>,
+) -> Result<String, String> {
     // 项目或任务记忆只能命中相同范围；无范围的长期经验可跨项目复用。
     let rows = client.query("SELECT tier, content FROM agent_memories WHERE agent_id = $1 AND status = 'active' AND (project_id IS NULL OR project_id = $2) AND (task_id IS NULL OR task_id = $3) ORDER BY updated_at DESC LIMIT 20", &[&agent_id, &project_id, &task_id]).await.map_err(|error| error.to_string())?;
-    if rows.is_empty() { return Ok("无相关记忆".to_owned()); }
-    Ok(rows.iter().map(|row| format!("- [{}] {}", row.get::<_, String>(0), row.get::<_, String>(1))).collect::<Vec<_>>().join("\n"))
+    if rows.is_empty() {
+        return Ok("无相关记忆".to_owned());
+    }
+    Ok(rows
+        .iter()
+        .map(|row| {
+            format!(
+                "- [{}] {}",
+                row.get::<_, String>(0),
+                row.get::<_, String>(1)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
 }
 
 /// 在外部执行前提交 started 事件，长任务运行期间前端即可看到真实状态。
-async fn mark_attempt_started(database_url: &str, runner_id: &str, job: &ClaimedJob, mode: &str) -> Result<(), String> {
+async fn mark_attempt_started(
+    database_url: &str,
+    runner_id: &str,
+    job: &ClaimedJob,
+    mode: &str,
+) -> Result<(), String> {
     let client = connect(database_url).await?;
     client.execute("INSERT INTO execution_events (job_id, attempt_id, task_id, event_type, payload) VALUES ($1, $2, $3, 'attempt.started', $4)", &[&job.job_id, &job.attempt_id, &job.task_id, &json!({ "runner_id": runner_id, "kind": job.kind.clone(), "mode": mode })]).await.map(|_| ()).map_err(|error| error.to_string())
 }
 
 /// 完成方案作业，把 Todo 推进到等待 Human 确认并保存 Codex 输出。
-async fn finish_plan_job(database_url: &str, runner_id: &str, job: &ClaimedJob, task_id: &str, output_content: &str, thread_id: Option<&str>) -> Result<(), String> {
+async fn finish_plan_job(
+    database_url: &str,
+    runner_id: &str,
+    job: &ClaimedJob,
+    task_id: &str,
+    output_content: &str,
+    thread_id: Option<&str>,
+) -> Result<(), String> {
     let mut client = connect(database_url).await?;
-    let transaction = client.transaction().await.map_err(|error| error.to_string())?;
+    let transaction = client
+        .transaction()
+        .await
+        .map_err(|error| error.to_string())?;
     let updated = transaction.execute("UPDATE tasks SET board_stage = 'plan_review', plan_status = 'reviewing', execution_status = 'succeeded', revision = revision + 1, updated_at = now() WHERE id = $1 AND board_stage = 'todo'", &[&task_id]).await.map_err(|error| error.to_string())?;
     if updated != 1 {
         drop(transaction);
         return mark_failed(database_url, job, "task is no longer in todo").await;
     }
     transaction.execute("INSERT INTO task_events (task_id, event_type, actor_type, actor_id, after_data, event_data) VALUES ($1, 'plan.generated', 'runner', $2, $3, $4)", &[&task_id, &runner_id, &json!({ "board_stage": "plan_review", "plan_status": "reviewing" }), &json!({ "job_id": job.job_id.clone(), "attempt_id": job.attempt_id.clone(), "codex_thread_id": thread_id })]).await.map_err(|error| error.to_string())?;
-    finish_job_records(&transaction, job, task_id, "plan", output_content, runner_id, thread_id).await?;
-    transaction.commit().await.map_err(|error| error.to_string())
+    finish_job_records(
+        &transaction,
+        job,
+        task_id,
+        "plan",
+        output_content,
+        runner_id,
+        thread_id,
+    )
+    .await?;
+    transaction
+        .commit()
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// 完成执行作业，把任务推进到等待验收并保存 Codex 输出。
-async fn finish_execution_job(database_url: &str, runner_id: &str, job: &ClaimedJob, task_id: &str, output_content: &str, thread_id: Option<&str>) -> Result<(), String> {
+async fn finish_execution_job(
+    database_url: &str,
+    runner_id: &str,
+    job: &ClaimedJob,
+    task_id: &str,
+    output_content: &str,
+    thread_id: Option<&str>,
+) -> Result<(), String> {
     let mut client = connect(database_url).await?;
-    let transaction = client.transaction().await.map_err(|error| error.to_string())?;
-    let updated = transaction.execute("UPDATE tasks SET board_stage = 'acceptance', execution_status = 'succeeded', progress_percent = 100, revision = revision + 1, updated_at = now() WHERE id = $1 AND board_stage = 'in_progress'", &[&task_id]).await.map_err(|error| error.to_string())?;
+    let transaction = client
+        .transaction()
+        .await
+        .map_err(|error| error.to_string())?;
+    // 工作流执行节点已经由已发布流程定义约束，不额外进入 Human 验收；普通研发任务仍保持既有验收阶段。
+    let workflow_run_id = job
+        .payload
+        .get("workflow_run_id")
+        .and_then(serde_json::Value::as_str);
+
+    // 工作流实例控制与子任务完成竞争时锁定运行记录；暂停或终止先提交后，晚到结果不得覆盖控制终态。
+    if let Some(workflow_run_id) = workflow_run_id {
+        let run = transaction
+            .query_opt(
+                "SELECT status FROM workflow_runs WHERE id = $1 FOR UPDATE",
+                &[&workflow_run_id],
+            )
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "workflow run not found while completing child task".to_owned())?;
+        let run_status = run.get::<_, String>(0);
+        if run_status == "paused" || run_status == "terminated" {
+            let job_status = if run_status == "paused" { "paused" } else { "cancelled" };
+            transaction
+                .execute(
+                    "UPDATE execution_attempts SET status = 'cancelled', finished_at = now(), failure_message = $2 WHERE id = $1",
+                    &[&job.attempt_id, &format!("workflow run is {run_status}")],
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            transaction
+                .execute(
+                    "UPDATE execution_jobs SET status = $2, updated_at = now() WHERE id = $1",
+                    &[&job.job_id, &job_status],
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            transaction
+                .execute(
+                    concat!(
+                        "INSERT INTO execution_events (job_id, attempt_id, task_id, event_type, payload) ",
+                        "VALUES ($1, $2, $3, 'job.result_discarded', $4)"
+                    ),
+                    &[
+                        &job.job_id,
+                        &job.attempt_id,
+                        &job.task_id,
+                        &json!({ "workflow_run_id": workflow_run_id, "run_status": run_status }),
+                    ],
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            transaction
+                .commit()
+                .await
+                .map_err(|error| error.to_string())?;
+            return Ok(());
+        }
+    }
+
+    // 普通任务进入验收阶段，工作流子任务则由流程定义直接判定完成。
+    let (target_stage, acceptance_status) = if workflow_run_id.is_some() {
+        ("done", "passed")
+    } else {
+        ("acceptance", "not_started")
+    };
+    let updated = transaction
+        .execute(
+            concat!(
+                "UPDATE tasks SET board_stage = $2, execution_status = 'succeeded', acceptance_status = $3, progress_percent = 100, ",
+                "revision = revision + 1, updated_at = now() WHERE id = $1 AND board_stage = 'in_progress'"
+            ),
+            &[&task_id, &target_stage, &acceptance_status],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
     if updated != 1 {
         drop(transaction);
         return mark_failed(database_url, job, "task is no longer in progress").await;
     }
-    transaction.execute("INSERT INTO task_events (task_id, event_type, actor_type, actor_id, after_data, event_data) VALUES ($1, 'execution.completed', 'runner', $2, $3, $4)", &[&task_id, &runner_id, &json!({ "board_stage": "acceptance", "execution_status": "succeeded" }), &json!({ "job_id": job.job_id.clone(), "attempt_id": job.attempt_id.clone(), "codex_thread_id": thread_id })]).await.map_err(|error| error.to_string())?;
-    finish_job_records(&transaction, job, task_id, "summary", output_content, runner_id, thread_id).await?;
-    transaction.commit().await.map_err(|error| error.to_string())
+    transaction
+        .execute(
+            "INSERT INTO task_events (task_id, event_type, actor_type, actor_id, after_data, event_data) VALUES ($1, 'execution.completed', 'runner', $2, $3, $4)",
+            &[
+                &task_id,
+                &runner_id,
+                &json!({ "board_stage": target_stage, "execution_status": "succeeded", "acceptance_status": acceptance_status }),
+                &json!({ "job_id": job.job_id.clone(), "attempt_id": job.attempt_id.clone(), "codex_thread_id": thread_id, "workflow_run_id": workflow_run_id }),
+            ],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    finish_job_records(
+        &transaction,
+        job,
+        task_id,
+        "summary",
+        output_content,
+        runner_id,
+        thread_id,
+    )
+    .await?;
+    transaction
+        .commit()
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// 完成不改变任务状态的通用 Agent 作业，例如职责草案。
-async fn finish_general_job(database_url: &str, runner_id: &str, job: &ClaimedJob, output_type: &str, output_content: &str, thread_id: Option<&str>) -> Result<(), String> {
+async fn finish_general_job(
+    database_url: &str,
+    runner_id: &str,
+    job: &ClaimedJob,
+    output_type: &str,
+    output_content: &str,
+    thread_id: Option<&str>,
+) -> Result<(), String> {
     // 通用作业只写执行事实和输出，不自动覆盖 Agent 配置。
     let mut client = connect(database_url).await?;
-    let transaction = client.transaction().await.map_err(|error| error.to_string())?;
-    finish_general_records(&transaction, runner_id, job, output_type, output_content, thread_id).await?;
-    transaction.commit().await.map_err(|error| error.to_string())
+    let transaction = client
+        .transaction()
+        .await
+        .map_err(|error| error.to_string())?;
+    finish_general_records(
+        &transaction,
+        runner_id,
+        job,
+        output_type,
+        output_content,
+        thread_id,
+    )
+    .await?;
+    transaction
+        .commit()
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// 完成对话总结作业，将总结追加为系统消息并正式归档临时群聊。
-async fn finish_conversation_summary(database_url: &str, runner_id: &str, job: &ClaimedJob, output_content: &str, thread_id: Option<&str>) -> Result<(), String> {
+async fn finish_conversation_summary(
+    database_url: &str,
+    runner_id: &str,
+    job: &ClaimedJob,
+    output_content: &str,
+    thread_id: Option<&str>,
+) -> Result<(), String> {
     // 对话必须仍处于 archiving，避免用户恢复或其他作业改变状态后写入过期总结。
-    let conversation_id = job.conversation_id.as_ref().ok_or_else(|| "conversation summary requires conversation_id".to_owned())?;
+    let conversation_id = job
+        .conversation_id
+        .as_ref()
+        .ok_or_else(|| "conversation summary requires conversation_id".to_owned())?;
     let mut client = connect(database_url).await?;
-    let transaction = client.transaction().await.map_err(|error| error.to_string())?;
+    let transaction = client
+        .transaction()
+        .await
+        .map_err(|error| error.to_string())?;
     let updated = transaction.execute("UPDATE conversations SET status = 'archived', archived_at = now(), updated_at = now() WHERE id = $1 AND status = 'archiving'", &[&conversation_id]).await.map_err(|error| error.to_string())?;
     if updated != 1 {
         drop(transaction);
@@ -624,8 +1044,19 @@ async fn finish_conversation_summary(database_url: &str, runner_id: &str, job: &
 
     // 总结以追加消息保存，原始对话顺序和内容不做修改。
     transaction.execute("INSERT INTO conversation_messages (id, conversation_id, author_type, author_id, content, message_type) VALUES ($1, $2, 'system', 'runner', $3, 'summary')", &[&Uuid::new_v4().to_string(), &conversation_id, &output_content]).await.map_err(|error| error.to_string())?;
-    finish_general_records(&transaction, runner_id, job, "conversation_summary", output_content, thread_id).await?;
-    transaction.commit().await.map_err(|error| error.to_string())
+    finish_general_records(
+        &transaction,
+        runner_id,
+        job,
+        "conversation_summary",
+        output_content,
+        thread_id,
+    )
+    .await?;
+    transaction
+        .commit()
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// 完成文档刷新：锁定章节只留待审候选，存在待审候选时记冲突，否则应用候选并创建完整版本。
@@ -640,12 +1071,20 @@ async fn finish_document_refresh_job(
     // 空候选不能覆盖现有章节，按普通执行失败进入既有重试机制且不触碰任务状态。
     let proposed_content = output_content.trim();
     if proposed_content.is_empty() {
-        return mark_failed(database_url, job, "document refresh produced empty candidate").await;
+        return mark_failed(
+            database_url,
+            job,
+            "document refresh produced empty candidate",
+        )
+        .await;
     }
 
     // 同时锁定文档和目标章节，候选判重、章节更新及版本号递增在一个事务内串行化。
     let mut client = connect(database_url).await?;
-    let transaction = client.transaction().await.map_err(|error| error.to_string())?;
+    let transaction = client
+        .transaction()
+        .await
+        .map_err(|error| error.to_string())?;
     let row = transaction
         .query_opt(
             concat!(
@@ -676,8 +1115,14 @@ async fn finish_document_refresh_job(
         .or_else(|| job.payload.get("trigger"))
         .and_then(serde_json::Value::as_str)
         .unwrap_or("unspecified");
-    let source_task_id = job.payload.get("source_task_id").and_then(serde_json::Value::as_str);
-    let source_conversation_id = job.payload.get("source_conversation_id").and_then(serde_json::Value::as_str);
+    let source_task_id = job
+        .payload
+        .get("source_task_id")
+        .and_then(serde_json::Value::as_str);
+    let source_conversation_id = job
+        .payload
+        .get("source_conversation_id")
+        .and_then(serde_json::Value::as_str);
     let source_id = source_task_id.or(source_conversation_id);
 
     // 已有待审候选或生成期间发生章节修改时保留冲突候选，避免多个来源静默覆盖。
@@ -816,30 +1261,106 @@ async fn finish_document_refresh_job(
         )
         .await
         .map_err(|error| error.to_string())?;
-    finish_general_records(&transaction, runner_id, job, "document_update_candidate", proposed_content, thread_id).await?;
-    transaction.commit().await.map_err(|error| error.to_string())
+    finish_general_records(
+        &transaction,
+        runner_id,
+        job,
+        "document_update_candidate",
+        proposed_content,
+        thread_id,
+    )
+    .await?;
+    transaction
+        .commit()
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// 在调用方事务内保存通用作业输出、尝试状态和审计事件。
-async fn finish_general_records(transaction: &tokio_postgres::Transaction<'_>, runner_id: &str, job: &ClaimedJob, output_type: &str, output_content: &str, thread_id: Option<&str>) -> Result<(), String> {
+async fn finish_general_records(
+    transaction: &tokio_postgres::Transaction<'_>,
+    runner_id: &str,
+    job: &ClaimedJob,
+    output_type: &str,
+    output_content: &str,
+    thread_id: Option<&str>,
+) -> Result<(), String> {
     // 输出携带全部可用业务作用域，后续页面无需解析 payload 才能定位来源。
-    transaction.execute("INSERT INTO run_outputs (id, job_id, task_id, project_id, agent_id, conversation_id, output_type, content) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)", &[&Uuid::new_v4().to_string(), &job.job_id, &job.task_id, &job.project_id, &job.agent_id, &job.conversation_id, &output_type, &output_content]).await.map_err(|error| error.to_string())?;
+    let workflow_run_id = job
+        .payload
+        .get("run_id")
+        .or_else(|| job.payload.get("workflow_run_id"))
+        .and_then(serde_json::Value::as_str);
+    let node_run_id = job
+        .payload
+        .get("node_run_id")
+        .and_then(serde_json::Value::as_str);
+    transaction
+        .execute(
+            concat!(
+                "INSERT INTO run_outputs (id, job_id, task_id, project_id, agent_id, conversation_id, workflow_run_id, node_run_id, output_type, content) ",
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"
+            ),
+            &[
+                &Uuid::new_v4().to_string(), &job.job_id, &job.task_id, &job.project_id, &job.agent_id, &job.conversation_id,
+                &workflow_run_id, &node_run_id, &output_type, &output_content,
+            ],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
     transaction.execute("INSERT INTO execution_events (job_id, attempt_id, task_id, project_id, agent_id, conversation_id, event_type, payload) VALUES ($1, $2, $3, $4, $5, $6, 'output.created', $7)", &[&job.job_id, &job.attempt_id, &job.task_id, &job.project_id, &job.agent_id, &job.conversation_id, &json!({ "output_type": output_type, "codex_thread_id": thread_id })]).await.map_err(|error| error.to_string())?;
 
     // 尝试与作业在同一事务进入成功状态，避免输出可见但作业仍显示运行中。
     transaction.execute("UPDATE execution_attempts SET status = 'succeeded', heartbeat_at = now(), finished_at = now(), codex_thread_id = $2 WHERE id = $1", &[&job.attempt_id, &thread_id]).await.map_err(|error| error.to_string())?;
-    transaction.execute("UPDATE execution_jobs SET status = 'succeeded', updated_at = now() WHERE id = $1", &[&job.job_id]).await.map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "UPDATE execution_jobs SET status = 'succeeded', updated_at = now() WHERE id = $1",
+            &[&job.job_id],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
     transaction.execute("INSERT INTO execution_events (job_id, attempt_id, task_id, project_id, agent_id, conversation_id, event_type, payload) VALUES ($1, $2, $3, $4, $5, $6, 'job.succeeded', $7)", &[&job.job_id, &job.attempt_id, &job.task_id, &job.project_id, &job.agent_id, &job.conversation_id, &json!({ "runner_id": runner_id, "kind": job.kind.clone(), "codex_thread_id": thread_id })]).await.map_err(|error| error.to_string())?;
     Ok(())
 }
 
 /// 在业务状态更新事务内统一写入输出、成功状态和审计事件。
-async fn finish_job_records(transaction: &tokio_postgres::Transaction<'_>, job: &ClaimedJob, task_id: &str, output_type: &str, output_content: &str, runner_id: &str, thread_id: Option<&str>) -> Result<(), String> {
+async fn finish_job_records(
+    transaction: &tokio_postgres::Transaction<'_>,
+    job: &ClaimedJob,
+    task_id: &str,
+    output_type: &str,
+    output_content: &str,
+    runner_id: &str,
+    thread_id: Option<&str>,
+) -> Result<(), String> {
     // 任务输出同时带上项目和 Agent 作用域，便于后续运行记录和记忆提取使用。
-    transaction.execute("INSERT INTO run_outputs (id, job_id, task_id, project_id, agent_id, output_type, content) VALUES ($1, $2, $3, $4, $5, $6, $7)", &[&Uuid::new_v4().to_string(), &job.job_id, &task_id, &job.project_id, &job.agent_id, &output_type, &output_content]).await.map_err(|error| error.to_string())?;
+    let workflow_run_id = job
+        .payload
+        .get("workflow_run_id")
+        .and_then(serde_json::Value::as_str);
+    let node_run_id = job
+        .payload
+        .get("node_run_id")
+        .and_then(serde_json::Value::as_str);
+    transaction
+        .execute(
+            concat!(
+                "INSERT INTO run_outputs (id, job_id, task_id, project_id, agent_id, workflow_run_id, node_run_id, output_type, content) ",
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
+            ),
+            &[&Uuid::new_v4().to_string(), &job.job_id, &task_id, &job.project_id, &job.agent_id, &workflow_run_id, &node_run_id, &output_type, &output_content],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
     transaction.execute("INSERT INTO execution_events (job_id, attempt_id, task_id, event_type, payload) VALUES ($1, $2, $3, 'output.created', $4)", &[&job.job_id, &job.attempt_id, &job.task_id, &json!({ "output_type": output_type, "codex_thread_id": thread_id })]).await.map_err(|error| error.to_string())?;
     transaction.execute("UPDATE execution_attempts SET status = 'succeeded', heartbeat_at = now(), finished_at = now(), codex_thread_id = $2 WHERE id = $1", &[&job.attempt_id, &thread_id]).await.map_err(|error| error.to_string())?;
-    transaction.execute("UPDATE execution_jobs SET status = 'succeeded', updated_at = now() WHERE id = $1", &[&job.job_id]).await.map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "UPDATE execution_jobs SET status = 'succeeded', updated_at = now() WHERE id = $1",
+            &[&job.job_id],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
     transaction.execute("INSERT INTO execution_events (job_id, attempt_id, task_id, event_type, payload) VALUES ($1, $2, $3, 'job.succeeded', $4)", &[&job.job_id, &job.attempt_id, &job.task_id, &json!({ "runner_id": runner_id, "kind": job.kind.clone(), "codex_thread_id": thread_id })]).await.map_err(|error| error.to_string())?;
     Ok(())
 }
@@ -847,7 +1368,10 @@ async fn finish_job_records(transaction: &tokio_postgres::Transaction<'_>, job: 
 /// 为失败作业补写失败尝试和事件，避免执行事务回滚后丢失失败原因。
 async fn mark_failed(database_url: &str, job: &ClaimedJob, message: &str) -> Result<(), String> {
     let mut client = connect(database_url).await?;
-    let transaction = client.transaction().await.map_err(|error| error.to_string())?;
+    let transaction = client
+        .transaction()
+        .await
+        .map_err(|error| error.to_string())?;
     transaction.execute("UPDATE execution_attempts SET status = 'failed', finished_at = now(), failure_message = $2 WHERE id = $1", &[&job.attempt_id, &message]).await.map_err(|error| error.to_string())?;
     // 第一次和第二次失败分别延迟 1 分钟、5 分钟，达到三次总尝试后停止自动重试。
     let job_row = transaction.query_one("UPDATE execution_jobs SET status = CASE WHEN attempt_count >= max_attempts THEN 'failed' ELSE 'queued' END, available_at = CASE WHEN attempt_count >= max_attempts THEN available_at WHEN attempt_count = 1 THEN now() + interval '1 minute' ELSE now() + interval '5 minutes' END, updated_at = now() WHERE id = $1 RETURNING status", &[&job.job_id]).await.map_err(|error| error.to_string())?;
@@ -855,7 +1379,11 @@ async fn mark_failed(database_url: &str, job: &ClaimedJob, message: &str) -> Res
     if job.kind != "refresh_project_document" {
         if let Some(task_id) = job.task_id.as_ref() {
             // 达到重试上限才让任务显示失败，仍可重试的作业保持 queued 语义。
-            let task_status = if job_status == "failed" { "failed" } else { "queued" };
+            let task_status = if job_status == "failed" {
+                "failed"
+            } else {
+                "queued"
+            };
             transaction
                 .execute(
                     "UPDATE tasks SET execution_status = $2, updated_at = now() WHERE id = $1 AND board_stage IN ('todo', 'in_progress')",
@@ -871,7 +1399,46 @@ async fn mark_failed(database_url: &str, job: &ClaimedJob, message: &str) -> Res
         if let Some(conversation_id) = job.conversation_id.as_ref() {
             transaction.execute("UPDATE conversations SET status = 'active', updated_at = now() WHERE id = $1 AND status = 'archiving'", &[&conversation_id]).await.map_err(|error| error.to_string())?;
         }
+        if job.kind == "run_workflow" {
+            if let Some(run_id) = job
+                .payload
+                .get("run_id")
+                .and_then(serde_json::Value::as_str)
+            {
+                // 工作流推进作业耗尽重试后同步关闭运行和父任务，避免看板永久停留在运行中。
+                transaction
+                    .execute(
+                        concat!(
+                            "UPDATE workflow_runs SET status = 'failed', error_message = $2, finished_at = now(), updated_at = now() ",
+                            "WHERE id = $1 AND status NOT IN ('succeeded', 'terminated')"
+                        ),
+                        &[&run_id, &message],
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                transaction
+                    .execute(
+                        concat!(
+                            "UPDATE tasks SET execution_status = 'failed', revision = revision + 1, updated_at = now() ",
+                            "WHERE id = (SELECT parent_task_id FROM workflow_runs WHERE id = $1)"
+                        ),
+                        &[&run_id],
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                transaction
+                    .execute(
+                        "INSERT INTO workflow_run_events (run_id, event_type, payload) VALUES ($1, 'run.failed', $2)",
+                        &[&run_id, &json!({ "message": message, "job_id": job.job_id.clone() })],
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+        }
     }
     transaction.execute("INSERT INTO execution_events (job_id, attempt_id, task_id, project_id, agent_id, conversation_id, event_type, payload) VALUES ($1, $2, $3, $4, $5, $6, 'job.failed', $7)", &[&job.job_id, &job.attempt_id, &job.task_id, &job.project_id, &job.agent_id, &job.conversation_id, &json!({ "message": message })]).await.map_err(|error| error.to_string())?;
-    transaction.commit().await.map_err(|error| error.to_string())
+    transaction
+        .commit()
+        .await
+        .map_err(|error| error.to_string())
 }

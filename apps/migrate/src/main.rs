@@ -6,7 +6,9 @@ use tokio_postgres::NoTls;
 async fn main() {
     // 读取数据库连接配置并建立迁移连接，失败时阻止后续服务启动。
     let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be configured");
-    let (client, connection) = tokio_postgres::connect(&database_url, NoTls).await.expect("connect database");
+    let (client, connection) = tokio_postgres::connect(&database_url, NoTls)
+        .await
+        .expect("connect database");
     tokio::spawn(async move {
         if let Err(error) = connection.await {
             eprintln!("migration connection ended: {error}");
@@ -407,7 +409,132 @@ async fn main() {
                last_refreshed_at = COALESCE(pd.last_refreshed_at, now())
                FROM (SELECT document_id, max(version_no) AS version_no FROM project_document_versions GROUP BY document_id) versions
                WHERE pd.id = versions.document_id AND pd.current_version_no < versions.version_no;
-             INSERT INTO schema_migrations (version) VALUES ('0006_m4_project_context') ON CONFLICT (version) DO NOTHING;",
+             INSERT INTO schema_migrations (version) VALUES ('0006_m4_project_context') ON CONFLICT (version) DO NOTHING;
+             CREATE TABLE IF NOT EXISTS workflows (
+               id TEXT PRIMARY KEY,
+               project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+               name TEXT NOT NULL,
+               description TEXT NOT NULL DEFAULT '',
+               status TEXT NOT NULL DEFAULT 'active',
+               current_version_no INTEGER NOT NULL DEFAULT 0,
+               created_by TEXT NOT NULL DEFAULT 'human',
+               created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+               updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+             );
+             CREATE INDEX IF NOT EXISTS workflows_project_idx ON workflows(project_id, status, updated_at DESC);
+             CREATE TABLE IF NOT EXISTS workflow_versions (
+               id TEXT PRIMARY KEY,
+               workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+               version_no INTEGER NOT NULL,
+               status TEXT NOT NULL DEFAULT 'draft',
+               definition JSONB NOT NULL DEFAULT '{}'::jsonb,
+               created_by TEXT NOT NULL DEFAULT 'human',
+               created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+               UNIQUE (workflow_id, version_no)
+             );
+             CREATE TABLE IF NOT EXISTS workflow_nodes (
+               id TEXT PRIMARY KEY,
+               version_id TEXT NOT NULL REFERENCES workflow_versions(id) ON DELETE CASCADE,
+               node_key TEXT NOT NULL,
+               node_type TEXT NOT NULL,
+               label TEXT NOT NULL,
+               config JSONB NOT NULL DEFAULT '{}'::jsonb,
+               position_x DOUBLE PRECISION NOT NULL DEFAULT 0,
+               position_y DOUBLE PRECISION NOT NULL DEFAULT 0,
+               UNIQUE (version_id, node_key)
+             );
+             CREATE TABLE IF NOT EXISTS workflow_edges (
+               id TEXT PRIMARY KEY,
+               version_id TEXT NOT NULL REFERENCES workflow_versions(id) ON DELETE CASCADE,
+               edge_key TEXT NOT NULL,
+               source_node_key TEXT NOT NULL,
+               target_node_key TEXT NOT NULL,
+               label TEXT NOT NULL DEFAULT '',
+               condition JSONB NOT NULL DEFAULT '{}'::jsonb,
+               UNIQUE (version_id, edge_key)
+             );
+             CREATE INDEX IF NOT EXISTS workflow_nodes_version_idx ON workflow_nodes(version_id);
+             CREATE INDEX IF NOT EXISTS workflow_edges_version_idx ON workflow_edges(version_id);
+             CREATE TABLE IF NOT EXISTS workflow_schedules (
+               id TEXT PRIMARY KEY,
+               workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+               schedule_type TEXT NOT NULL,
+               schedule_expression TEXT NOT NULL,
+               parsed_rule JSONB NOT NULL DEFAULT '{}'::jsonb,
+               timezone TEXT NOT NULL DEFAULT 'Asia/Shanghai',
+               enabled BOOLEAN NOT NULL DEFAULT FALSE,
+               next_run_at TIMESTAMPTZ,
+               created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+               updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+             );
+             CREATE INDEX IF NOT EXISTS workflow_schedules_due_idx ON workflow_schedules(enabled, next_run_at);
+             CREATE TABLE IF NOT EXISTS workflow_runs (
+               id TEXT PRIMARY KEY,
+               workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+               version_id TEXT NOT NULL REFERENCES workflow_versions(id),
+               project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+               status TEXT NOT NULL DEFAULT 'queued',
+               trigger_type TEXT NOT NULL DEFAULT 'manual',
+               input JSONB NOT NULL DEFAULT '{}'::jsonb,
+               output JSONB NOT NULL DEFAULT '{}'::jsonb,
+               error_message TEXT,
+               started_at TIMESTAMPTZ,
+               finished_at TIMESTAMPTZ,
+               created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+               updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+             );
+             CREATE INDEX IF NOT EXISTS workflow_runs_workflow_idx ON workflow_runs(workflow_id, created_at DESC);
+             CREATE TABLE IF NOT EXISTS workflow_node_runs (
+               id TEXT PRIMARY KEY,
+               run_id TEXT NOT NULL REFERENCES workflow_runs(id) ON DELETE CASCADE,
+               node_key TEXT NOT NULL,
+               node_type TEXT NOT NULL,
+               status TEXT NOT NULL DEFAULT 'queued',
+               task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+               attempt_count INTEGER NOT NULL DEFAULT 0,
+               input JSONB NOT NULL DEFAULT '{}'::jsonb,
+               output JSONB NOT NULL DEFAULT '{}'::jsonb,
+               error_message TEXT,
+               started_at TIMESTAMPTZ,
+               finished_at TIMESTAMPTZ,
+               created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+               updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+               UNIQUE (run_id, node_key)
+             );
+             CREATE INDEX IF NOT EXISTS workflow_node_runs_run_idx ON workflow_node_runs(run_id, created_at);
+             CREATE TABLE IF NOT EXISTS approval_requests (
+               id TEXT PRIMARY KEY,
+               request_type TEXT NOT NULL,
+               workflow_run_id TEXT REFERENCES workflow_runs(id) ON DELETE CASCADE,
+               node_run_id TEXT REFERENCES workflow_node_runs(id) ON DELETE CASCADE,
+               task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+               execution_job_id TEXT REFERENCES execution_jobs(id) ON DELETE SET NULL,
+               status TEXT NOT NULL DEFAULT 'pending',
+               prompt TEXT NOT NULL DEFAULT '',
+               response_data JSONB NOT NULL DEFAULT '{}'::jsonb,
+               requested_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+               resolved_at TIMESTAMPTZ,
+               resolved_by TEXT
+             );
+             CREATE INDEX IF NOT EXISTS approval_requests_pending_idx ON approval_requests(status, requested_at);
+             CREATE INDEX IF NOT EXISTS approval_requests_run_idx ON approval_requests(workflow_run_id, requested_at);
+             ALTER TABLE tasks ADD COLUMN IF NOT EXISTS source_type TEXT NOT NULL DEFAULT 'manual';
+             ALTER TABLE tasks ADD COLUMN IF NOT EXISTS source_workflow_run_id TEXT REFERENCES workflow_runs(id) ON DELETE SET NULL;
+             ALTER TABLE tasks ADD COLUMN IF NOT EXISTS source_node_run_id TEXT REFERENCES workflow_node_runs(id) ON DELETE SET NULL;
+             ALTER TABLE tasks ADD COLUMN IF NOT EXISTS workflow_name TEXT;
+             ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS parent_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL;
+             ALTER TABLE run_outputs ADD COLUMN IF NOT EXISTS workflow_run_id TEXT REFERENCES workflow_runs(id) ON DELETE CASCADE;
+             ALTER TABLE run_outputs ADD COLUMN IF NOT EXISTS node_run_id TEXT REFERENCES workflow_node_runs(id) ON DELETE SET NULL;
+             CREATE TABLE IF NOT EXISTS workflow_run_events (
+               id BIGSERIAL PRIMARY KEY,
+               run_id TEXT NOT NULL REFERENCES workflow_runs(id) ON DELETE CASCADE,
+               event_type TEXT NOT NULL,
+               node_key TEXT,
+               payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+               created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+             );
+             CREATE INDEX IF NOT EXISTS workflow_run_events_order_idx ON workflow_run_events(run_id, created_at, id);
+             INSERT INTO schema_migrations (version) VALUES ('0007_m5_workflows') ON CONFLICT (version) DO NOTHING;",
         )
         .await
         .expect("apply migration");
