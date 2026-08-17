@@ -17,7 +17,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     && cp /src/target/release/xiexu-server /src/target/release/xiexu-runner /src/target/release/xiexu-migrate /out/
 
 FROM node:22-bookworm-slim AS runtime
-RUN npm install -g @openai/codex@0.147.0 \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/* \
+    && npm install -g @openai/codex@0.147.0 \
     && npm cache clean --force
 COPY --from=rust-build /out/xiexu-server /usr/local/bin/xiexu-server
 COPY --from=rust-build /out/xiexu-runner /usr/local/bin/xiexu-runner

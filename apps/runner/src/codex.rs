@@ -1,5 +1,5 @@
 use serde_json::Value;
-use std::{env, path::PathBuf, process::Stdio, time::Duration};
+use std::{env, path::{Path, PathBuf}, process::Stdio, time::Duration};
 use tokio::{process::Command, time::timeout};
 use uuid::Uuid;
 
@@ -108,7 +108,22 @@ impl CodexConfig {
         kind: &str,
         context: TaskPromptContext<'_>,
     ) -> Result<CodexRunOutput, String> {
-        let workspace = self.prepare_workspace(context.project_id).await?;
+        // 未绑定 worktree 的作业保持使用项目默认目录，兼容既有任务和非研发类作业。
+        self.run_in_workspace(kind, context, None).await
+    }
+
+    /// 在已验证的项目默认目录或 worktree 会话目录中执行 Codex。
+    pub async fn run_in_workspace(
+        &self,
+        kind: &str,
+        context: TaskPromptContext<'_>,
+        workspace_override: Option<&Path>,
+    ) -> Result<CodexRunOutput, String> {
+        // 绑定 worktree 时重新完成真实路径校验，避免数据库读取和外部进程启动之间发生符号链接替换。
+        let workspace = match workspace_override {
+            Some(path) => self.prepare_worktree_workspace(context.project_id, path).await?,
+            None => self.prepare_workspace(context.project_id).await?,
+        };
         let prompt = build_prompt(kind, &context)?;
         let sandbox = if kind == "execute_task" {
             "workspace-write"
@@ -142,6 +157,31 @@ impl CodexConfig {
             .map_err(|_| format!("Codex run exceeded {} seconds", self.max_run_seconds))?
             .map_err(|error| format!("failed to start Codex: {error}"))?;
         parse_output(output.status.success(), &output.stdout, &output.stderr)
+    }
+
+    /// 校验指定 worktree 属于项目受管目录，拒绝相对路径、符号链接逃逸和跨项目目录。
+    pub async fn prepare_worktree_workspace(&self, project_id: &str, session_path: &Path) -> Result<PathBuf, String> {
+        // 先复用默认项目目录的 UUID 与符号链接防护，确保受管 worktree 根目录建立在可信项目目录下。
+        let project_workspace = self.prepare_workspace(project_id).await?;
+        if !session_path.is_absolute() {
+            return Err("worktree session path must be absolute".to_owned());
+        }
+
+        // 会话目录必须已经由控制面创建，Runner 绝不自行创建 worktree、分支或 Git 仓库。
+        let sessions_dir = project_workspace.join(".xiexu-worktrees");
+        let canonical_sessions = tokio::fs::canonicalize(&sessions_dir)
+            .await
+            .map_err(|error| format!("cannot resolve managed worktree directory: {error}"))?;
+        if !canonical_sessions.starts_with(&project_workspace) {
+            return Err("managed worktree directory escapes project workspace".to_owned());
+        }
+        let canonical_session = tokio::fs::canonicalize(session_path)
+            .await
+            .map_err(|error| format!("cannot resolve worktree session path: {error}"))?;
+        if !canonical_session.starts_with(&canonical_sessions) {
+            return Err("worktree session path escapes managed worktree directory".to_owned());
+        }
+        Ok(canonical_session)
     }
 
     /// 创建并校验项目工作区，防止符号链接或异常 ID 逃逸允许根目录。
@@ -343,5 +383,69 @@ mod tests {
         assert!(!outside.join(project_id).exists());
         std::fs::remove_dir_all(root).expect("remove workspace root");
         std::fs::remove_dir_all(outside).expect("remove outside root");
+    }
+
+    /// 已存在的会话目录必须解析到项目受管 .xiexu-worktrees 根目录之下。
+    #[tokio::test]
+    async fn accepts_worktree_session_inside_managed_project_directory() {
+        // 创建项目与会话目录，模拟控制面已经完成 Git worktree 创建后的文件布局。
+        let root = temporary_root("managed-worktree");
+        let project_id = Uuid::new_v4().to_string();
+        let session = root.join("projects").join(&project_id).join(".xiexu-worktrees").join("session-a");
+        std::fs::create_dir_all(&session).expect("create managed session directory");
+
+        // 返回路径必须是会话目录的真实路径，供外部 Codex 进程作为 current_dir 使用。
+        let workspace = test_config(root.clone())
+            .prepare_worktree_workspace(&project_id, &session)
+            .await
+            .expect("accept managed worktree session");
+        assert_eq!(workspace, std::fs::canonicalize(&session).expect("canonical session"));
+        std::fs::remove_dir_all(root).expect("remove test workspace");
+    }
+
+    /// 项目工作区内的普通目录不得伪装为 worktree 会话目录。
+    #[tokio::test]
+    async fn rejects_worktree_session_outside_managed_directory() {
+        // 创建看似属于项目但不在 .xiexu-worktrees 下的目录，验证目录层级是强制边界。
+        let root = temporary_root("unmanaged-worktree");
+        let project_id = Uuid::new_v4().to_string();
+        let project = root.join("projects").join(&project_id);
+        let session = project.join("unmanaged-session");
+        std::fs::create_dir_all(project.join(".xiexu-worktrees")).expect("create managed root");
+        std::fs::create_dir_all(&session).expect("create unmanaged session");
+
+        // 普通目录不能被用于执行研发任务，避免任务跳出控制面创建的 worktree 集合。
+        let error = test_config(root.clone())
+            .prepare_worktree_workspace(&project_id, &session)
+            .await
+            .expect_err("reject unmanaged worktree session");
+        assert_eq!(error, "worktree session path escapes managed worktree directory");
+        std::fs::remove_dir_all(root).expect("remove test workspace");
+    }
+
+    /// Unix 环境下受管目录中的符号链接也不得把 Codex 工作目录带到项目边界之外。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_worktree_session_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        // 预置受管会话根和一个指向外部的会话符号链接，模拟挂载被替换的攻击路径。
+        let root = temporary_root("worktree-link");
+        let outside = temporary_root("worktree-outside");
+        let project_id = Uuid::new_v4().to_string();
+        let sessions = root.join("projects").join(&project_id).join(".xiexu-worktrees");
+        std::fs::create_dir_all(&sessions).expect("create managed sessions root");
+        std::fs::create_dir_all(&outside).expect("create outside directory");
+        let session = sessions.join("session-link");
+        symlink(&outside, &session).expect("create escaping worktree symlink");
+
+        // 真实路径在允许根之外时必须拒绝，不能仅依赖未解析的字符串前缀。
+        let error = test_config(root.clone())
+            .prepare_worktree_workspace(&project_id, &session)
+            .await
+            .expect_err("reject escaping worktree symlink");
+        assert_eq!(error, "worktree session path escapes managed worktree directory");
+        std::fs::remove_dir_all(root).expect("remove test workspace");
+        std::fs::remove_dir_all(outside).expect("remove outside directory");
     }
 }

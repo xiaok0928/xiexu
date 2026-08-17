@@ -256,6 +256,24 @@ type WorkflowOutput = {
   created_at: string;
 };
 
+/** 项目 Git 可选能力的服务端配置快照，只消费服务端返回的真实仓库信息。 */
+type ProjectGitConfig = {
+  enabled: boolean;
+  repository_available?: boolean;
+  repository_path?: string | null;
+  status_summary?: string | null;
+  current_head?: string | null;
+};
+
+/** 已创建 detached worktree 的只读会话记录。 */
+type GitWorktreeSession = {
+  id: string;
+  task_id?: string | null;
+  status?: string | null;
+  worktree_path?: string | null;
+  created_at?: string | null;
+};
+
 const stages = ["backlog", "todo", "plan_review", "in_progress", "acceptance"];
 const stageLabels: Record<string, string> = { backlog: "Backlog", todo: "Todo", plan_review: "方案待确认", in_progress: "处理中", acceptance: "等待验收" };
 const navItems: Array<{ key: ViewKey; label: string; icon: string }> = [
@@ -404,7 +422,12 @@ function App() {
         {view === "agents" && <AgentCenter project={project} onError={setError} />}
         {view === "workflow" && project && <WorkflowCenter project={project} onError={setError} />}
         {view === "runs" && <Placeholder title="运行记录" description="任务运行记录已在任务详情展示，跨任务总览将在后续阶段接入。" />}
-        {view === "settings" && <Placeholder title="设置" description="MVP 暂不启用权限管理，系统设置将在后续接入。" />}
+        {view === "settings" &&
+          (project ? (
+            <GitSettings project={project} tasks={tasks} onError={setError} />
+          ) : (
+            <Placeholder title="设置" description="项目加载中，请稍后重试。" />
+          ))}
       </main>
     </div>
   );
@@ -2192,6 +2215,216 @@ function ConversationPanel({ conversationId, project, onChanged }: { conversatio
         </button>
       </div>
     </div>
+  );
+}
+
+/** 项目设置中的 Git/worktree 面板：管理开关并展示服务端创建的 detached worktree 会话。 */
+function GitSettings({ project, tasks, onError }: { project: Project; tasks: TaskCard[]; onError: (message: string) => void }) {
+  // 服务端状态与会话记录分别保存，避免客户端推测或模拟 Git 状态。
+  const [config, setConfig] = useState<ProjectGitConfig>();
+  const [sessions, setSessions] = useState<GitWorktreeSession[]>([]);
+  const [selectedTaskId, setSelectedTaskId] = useState("");
+  const [loading, setLoading] = useState(true);
+
+  // 独立提交态防止重复启停、重复创建及重复清理同一 worktree。
+  const [savingEnabled, setSavingEnabled] = useState(false);
+  const [creating, setCreating] = useState(false);
+  const [removingSessionId, setRemovingSessionId] = useState("");
+  const requestVersion = useRef(0);
+
+  /** 获取项目 Git 配置与 worktree 会话，仅提交当前最新请求的结果。 */
+  async function load() {
+    const requestId = ++requestVersion.current;
+    setLoading(true);
+
+    try {
+      const [nextConfig, nextSessions] = await Promise.all([
+        api<ProjectGitConfig>(`/api/projects/${project.id}/git`),
+        api<{ items: GitWorktreeSession[] }>(`/api/projects/${project.id}/git/sessions`),
+      ]);
+
+      // 项目切换或手动刷新后的旧响应不能覆盖较新的服务端快照。
+      if (requestId !== requestVersion.current) return;
+
+      setConfig(nextConfig);
+      setSessions(nextSessions.items);
+    } finally {
+      // 仅由当前请求结束加载态，避免较早请求提前解除禁用状态。
+      if (requestId === requestVersion.current) setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    // 切换项目时清除旧任务关联，并从服务端重新读取实际 Git 状态。
+    setSelectedTaskId("");
+    void load().catch((cause) => onError(cause instanceof Error ? cause.message : "Git 设置加载失败"));
+
+    // 组件卸载后使未完成请求失效，防止异步响应更新离开的页面。
+    return () => {
+      requestVersion.current += 1;
+    };
+  }, [project.id]);
+
+  /** 切换服务端 Git 开关，成功后重新读取最终配置而非乐观模拟结果。 */
+  async function updateEnabled(enabled: boolean) {
+    if (savingEnabled || loading) return;
+    setSavingEnabled(true);
+
+    try {
+      await api<unknown>(`/api/projects/${project.id}/git`, { method: "PATCH", body: JSON.stringify({ enabled }) });
+      await load();
+    } catch (cause) {
+      onError(cause instanceof Error ? cause.message : "Git 开关更新失败");
+    } finally {
+      setSavingEnabled(false);
+    }
+  }
+
+  /** 通过服务端创建 detached worktree，可选关联当前项目中的任务。 */
+  async function createSession() {
+    if (!config?.enabled || creating || loading) return;
+    setCreating(true);
+
+    try {
+      await api<unknown>(`/api/projects/${project.id}/git/sessions`, {
+        method: "POST",
+        body: JSON.stringify({ task_id: selectedTaskId || undefined }),
+      });
+      await load();
+    } catch (cause) {
+      onError(cause instanceof Error ? cause.message : "创建 detached worktree 失败");
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  /** 显式清理指定会话对应的 worktree，避免删除操作因误触发而执行。 */
+  async function removeSession(session: GitWorktreeSession) {
+    if (removingSessionId || !window.confirm(`确认清理 worktree 会话 ${session.id} 吗？`)) return;
+    setRemovingSessionId(session.id);
+
+    try {
+      await api<unknown>(`/api/git-worktree-sessions/${session.id}`, { method: "DELETE" });
+      await load();
+    } catch (cause) {
+      onError(cause instanceof Error ? cause.message : "清理 worktree 失败");
+    } finally {
+      setRemovingSessionId("");
+    }
+  }
+
+  // 使用本地任务标题补充服务端 task_id，关联信息不写回也不推断任务状态。
+  const selectedTask = tasks.find((task) => task.id === selectedTaskId);
+  const isMutating = savingEnabled || creating || Boolean(removingSessionId);
+  const availability = config?.repository_available === true ? "仓库可用" : config?.repository_available === false ? "仓库不可用" : "仓库状态未提供";
+
+  return (
+    <section className="git-settings view">
+      <div className="view-head">
+        <div>
+          <small>项目设置</small>
+          <h2>Git worktree</h2>
+        </div>
+      </div>
+
+      {/* Git 功能默认由服务端关闭，开关不会执行 init、分支或提交操作。 */}
+      <section className="panel git-config-panel">
+        <div className="git-config-head">
+          <div>
+            <h3>可选 Git 隔离</h3>
+            <p>未启用时不会创建任何 worktree。启用后仅可创建 detached worktree，会话状态保持只读。</p>
+          </div>
+          <label className="git-toggle">
+            <span>{config?.enabled ? "已启用" : "默认关闭"}</span>
+            <input
+              type="checkbox"
+              checked={config?.enabled ?? false}
+              disabled={!config || loading || isMutating}
+              onChange={(event) => void updateEnabled(event.target.checked)}
+            />
+          </label>
+        </div>
+
+        <dl className="git-summary">
+          <div>
+            <dt>仓库</dt>
+            <dd>{loading ? "正在读取" : availability}</dd>
+          </div>
+          <div>
+            <dt>状态摘要</dt>
+            <dd>{loading ? "正在读取" : config?.status_summary || "服务端未提供"}</dd>
+          </div>
+          <div>
+            <dt>仓库路径</dt>
+            <dd>{loading ? "正在读取" : config?.repository_path || "服务端未提供"}</dd>
+          </div>
+          <div>
+            <dt>当前提交</dt>
+            <dd>{loading ? "正在读取" : config?.current_head || "服务端未提供"}</dd>
+          </div>
+        </dl>
+      </section>
+
+      {/* 创建仅向指定会话 API 提交可选 task_id，不允许客户端传递 Git 命令参数。 */}
+      <section className="panel git-create-panel">
+        <div>
+          <h3>创建 detached worktree</h3>
+          <p>可关联一个任务，便于识别隔离执行上下文。</p>
+        </div>
+        <div className="git-create-controls">
+          <label>
+            关联任务
+            <select value={selectedTaskId} disabled={!config?.enabled || loading || isMutating} onChange={(event) => setSelectedTaskId(event.target.value)}>
+              <option value="">不关联任务</option>
+              {tasks.map((task) => (
+                <option key={task.id} value={task.id}>
+                  {task.title}
+                </option>
+              ))}
+            </select>
+          </label>
+          <button className="primary-action" disabled={!config?.enabled || loading || isMutating} onClick={() => void createSession()}>
+            {creating ? "创建中" : "创建 worktree"}
+          </button>
+        </div>
+        {selectedTask && <small className="git-selected-task">将关联任务：{selectedTask.title}</small>}
+      </section>
+
+      {/* 会话信息完全来自服务端；清理是唯一可写操作，需用户再次确认。 */}
+      <section className="panel git-sessions-panel">
+        <div className="git-section-head">
+          <div>
+            <h3>Worktree 会话</h3>
+            <small>会话状态只读，清理后将移除对应 worktree。</small>
+          </div>
+          <span>{sessions.length} 个会话</span>
+        </div>
+        {loading ? (
+          <p className="git-empty">正在读取会话。</p>
+        ) : sessions.length ? (
+          <div className="git-session-list">
+            {sessions.map((session) => {
+              const task = tasks.find((item) => item.id === session.task_id);
+              return (
+                <article className="git-session-row" key={session.id}>
+                  <div>
+                    <b>{task?.title || session.task_id || "未关联任务"}</b>
+                    <small>状态：{session.status || "服务端未提供"}</small>
+                    <small>路径：{session.worktree_path || "服务端未提供"}</small>
+                    <small>创建时间：{session.created_at || "服务端未提供"}</small>
+                  </div>
+                  <button className="danger-action" disabled={isMutating} onClick={() => void removeSession(session)}>
+                    {removingSessionId === session.id ? "清理中" : "清理 worktree"}
+                  </button>
+                </article>
+              );
+            })}
+          </div>
+        ) : (
+          <p className="git-empty">暂无 detached worktree 会话。</p>
+        )}
+      </section>
+    </section>
   );
 }
 

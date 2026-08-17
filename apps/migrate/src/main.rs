@@ -534,7 +534,31 @@ async fn main() {
                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
              );
              CREATE INDEX IF NOT EXISTS workflow_run_events_order_idx ON workflow_run_events(run_id, created_at, id);
-             INSERT INTO schema_migrations (version) VALUES ('0007_m5_workflows') ON CONFLICT (version) DO NOTHING;",
+INSERT INTO schema_migrations (version) VALUES ('0007_m5_workflows') ON CONFLICT (version) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS project_git_settings (
+    project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+    enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS git_worktree_sessions (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+    worktree_path TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    cleaned_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS git_worktree_sessions_project_idx ON git_worktree_sessions(project_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS git_worktree_sessions_task_idx ON git_worktree_sessions(task_id) WHERE task_id IS NOT NULL;
+
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS workspace_session_id TEXT REFERENCES git_worktree_sessions(id) ON DELETE SET NULL;
+
+INSERT INTO schema_migrations (version) VALUES ('0008_m7_git_worktrees') ON CONFLICT (version) DO NOTHING;",
         )
         .await
         .expect("apply migration");

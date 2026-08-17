@@ -3,7 +3,7 @@ mod workflow;
 
 use codex::{CodexConfig, TaskPromptContext};
 use serde_json::json;
-use std::{env, sync::Arc, time::Duration};
+use std::{env, path::PathBuf, sync::Arc, time::Duration};
 use tokio::task::JoinHandle;
 use tokio_postgres::{Client, NoTls};
 use uuid::Uuid;
@@ -458,10 +458,23 @@ async fn execute_job(
     scope_client.execute("UPDATE execution_jobs SET project_id = COALESCE(project_id, $2), agent_id = COALESCE(agent_id, $3), updated_at = now() WHERE id = $1", &[&job.job_id, &job.project_id, &job.agent_id]).await.map_err(|error| error.to_string())?;
     mark_attempt_started(database_url, runner_id, &job, codex_config.mode_name()).await?;
 
+    // 仅研发执行任务允许使用会话 worktree；其他作业始终保持默认项目目录或只读受控执行。
+    let workspace_override = if job.kind == "execute_task" {
+        resolve_task_worktree_workspace(
+            database_url,
+            job.task_id.as_deref().expect("validated task id"),
+            &context.project_id,
+            codex_config,
+        )
+        .await?
+    } else {
+        None
+    };
+
     // 真实模式只把必要业务字段传给 Codex，数据库配置和其他环境不会进入提示。
     let execution_result = if codex_config.is_real() {
         codex_config
-            .run(
+            .run_in_workspace(
                 &job.kind,
                 TaskPromptContext {
                     project_id: &context.project_id,
@@ -472,6 +485,7 @@ async fn execute_job(
                     agent_instructions: &context.agent_instructions,
                     memories: &context.memories,
                 },
+                workspace_override.as_deref(),
             )
             .await
             .map(|output| (output.content, output.thread_id))
@@ -554,6 +568,56 @@ async fn execute_job(
         }
         _ => unreachable!("job kind was validated"),
     }
+}
+
+/// 读取任务绑定的 worktree 会话，验证数据库归属和状态后交由 Codex 层解析真实目录。
+async fn resolve_task_worktree_workspace(
+    database_url: &str,
+    task_id: &str,
+    expected_project_id: &str,
+    codex_config: &CodexConfig,
+) -> Result<Option<PathBuf>, String> {
+    // 任务和会话必须在同一查询中读取，缺失会话时不能静默回退到默认项目目录执行。
+    let client = connect(database_url).await?;
+    let row = client
+        .query_one(
+            concat!(
+                "SELECT t.project_id, t.workspace_session_id, session.project_id, session.worktree_path, session.status FROM tasks t ",
+                "LEFT JOIN git_worktree_sessions session ON session.id = t.workspace_session_id WHERE t.id = $1"
+            ),
+            &[&task_id],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let task_project_id = row.get::<_, String>(0);
+    let session_id = row.get::<_, Option<String>>(1);
+    if task_project_id != expected_project_id {
+        return Err("task project does not match execution context".to_owned());
+    }
+    let Some(session_id) = session_id else {
+        return Ok(None);
+    };
+    let session_project_id = row
+        .get::<_, Option<String>>(2)
+        .ok_or_else(|| format!("worktree session {session_id} not found"))?;
+    let session_path = row
+        .get::<_, Option<String>>(3)
+        .ok_or_else(|| format!("worktree session {session_id} has no path"))?;
+    let session_status = row
+        .get::<_, Option<String>>(4)
+        .ok_or_else(|| format!("worktree session {session_id} has no status"))?;
+    if session_project_id != expected_project_id {
+        return Err("worktree session project does not match task project".to_owned());
+    }
+    if session_status != "active" {
+        return Err(format!("worktree session {session_id} is not active"));
+    }
+
+    // 路径校验会解析符号链接且强制要求位于项目 .xiexu-worktrees 下，不自动创建 Git 工作区。
+    codex_config
+        .prepare_worktree_workspace(expected_project_id, std::path::Path::new(&session_path))
+        .await
+        .map(Some)
 }
 
 /// 查询任务、项目、主责 Agent 和范围内记忆，不把执行控制字段交给 Codex。

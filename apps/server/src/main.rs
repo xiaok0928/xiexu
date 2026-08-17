@@ -1,4 +1,5 @@
 mod collaboration;
+mod git_workspace;
 mod project_context;
 mod workflow;
 
@@ -17,7 +18,7 @@ use tower_http::services::{ServeDir, ServeFile};
 use uuid::Uuid;
 
 /// 当前发布要求数据库至少完成的迁移版本，用于 readiness 阻止旧结构接收流量。
-const LATEST_MIGRATION_VERSION: &str = "0007_m5_workflows";
+const LATEST_MIGRATION_VERSION: &str = "0008_m7_git_worktrees";
 
 /// 服务端共享配置，统一承载数据库地址和 Codex 运行状态探测边界。
 #[derive(Clone)]
@@ -89,6 +90,7 @@ async fn main() {
         .route("/api/tasks/:task_id/events", get(list_events))
         .route("/api/tasks/:task_id/execution", get(list_execution))
         .merge(collaboration::routes())
+        .merge(git_workspace::routes())
         .merge(project_context::routes())
         .merge(workflow::routes())
         .nest_service(
