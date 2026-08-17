@@ -1,4 +1,5 @@
 mod collaboration;
+mod project_context;
 
 use axum::{extract::{Path, Query, State}, http::StatusCode, response::IntoResponse, routing::{get, post}, Json, Router};
 use serde_json::{json, Value};
@@ -59,10 +60,10 @@ async fn main() {
         .route("/api/projects/:project_id/tasks", get(list_tasks).post(create_task))
         .route("/api/tasks/:task_id", get(get_task).patch(update_task))
         .route("/api/tasks/:task_id/transitions", post(transition_task))
-        .route("/api/tasks/:task_id/comments", get(list_comments).post(create_comment))
         .route("/api/tasks/:task_id/events", get(list_events))
         .route("/api/tasks/:task_id/execution", get(list_execution))
         .merge(collaboration::routes())
+        .merge(project_context::routes())
         .nest_service("/", ServeDir::new("/app/web").append_index_html_on_directories(true).fallback(ServeFile::new("/app/web/index.html")))
         .with_state(state);
     // 绑定监听端口并启动 HTTP 服务，启动失败直接让容器退出以便编排发现。
@@ -141,7 +142,24 @@ fn project_json(row: &Row) -> Value { json!({ "id": row.get::<_, String>(0), "na
 
 /// 将数据库行映射为任务卡片响应，子任务数量由数据库事实源计算。
 fn task_json(row: &Row) -> Value {
-    json!({ "id": row.get::<_, String>(0), "project_id": row.get::<_, String>(1), "parent_task_id": row.get::<_, Option<String>>(2), "title": row.get::<_, String>(3), "description": row.get::<_, String>(4), "board_stage": row.get::<_, String>(5), "plan_status": row.get::<_, String>(6), "execution_status": row.get::<_, String>(7), "acceptance_status": row.get::<_, String>(8), "progress_percent": row.get::<_, i16>(9), "requires_plan_confirmation": row.get::<_, bool>(10), "children_count": row.get::<_, i64>(11), "revision": row.get::<_, i64>(12), "created_at": row.get::<_, String>(13), "updated_at": row.get::<_, String>(14) })
+    json!({
+        "id": row.get::<_, String>(0),
+        "project_id": row.get::<_, String>(1),
+        "parent_task_id": row.get::<_, Option<String>>(2),
+        "title": row.get::<_, String>(3),
+        "description": row.get::<_, String>(4),
+        "board_stage": row.get::<_, String>(5),
+        "plan_status": row.get::<_, String>(6),
+        "execution_status": row.get::<_, String>(7),
+        "acceptance_status": row.get::<_, String>(8),
+        "progress_percent": row.get::<_, i16>(9),
+        "requires_plan_confirmation": row.get::<_, bool>(10),
+        "children_count": row.get::<_, i64>(11),
+        "revision": row.get::<_, i64>(12),
+        "created_at": row.get::<_, String>(13),
+        "updated_at": row.get::<_, String>(14),
+        "collaboration_status": row.get::<_, String>(15)
+    })
 }
 
 /// 查询项目列表，默认按最近更新时间倒序返回。
@@ -165,7 +183,7 @@ async fn create_project(State(state): State<AppState>, Json(body): Json<Value>) 
 
     // 建立项目和项目概览事实，新建项目不会依赖异步任务才能进入可用状态。
     let row = transaction.query_one("INSERT INTO projects (id, name, description) VALUES ($1, $2, $3) RETURNING id, name, description, status, to_char(created_at, 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), to_char(updated_at, 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')", &[&id, &name, &description]).await.map_err(ApiError::database)?;
-    transaction.execute("INSERT INTO project_documents (id, project_id, doc_type, title) VALUES ($1, $2, 'overview', '项目概览')", &[&Uuid::new_v4().to_string(), &id]).await.map_err(ApiError::database)?;
+    project_context::initialize_project_document(&transaction, &id, &name, description).await?;
 
     // 为项目创建独立协调 Agent，使其职责补充和私有记忆不会与其他项目混用。
     let coordinator_name = format!("{name} 协调 Agent");
@@ -204,7 +222,21 @@ async fn list_tasks(State(state): State<AppState>, Path(project_id): Path<String
     let client = connect(&state).await?;
     let stage = query.get("board_stage");
     let parent_id = query.get("parent_id");
-    let rows = client.query("SELECT t.id, t.project_id, t.parent_task_id, t.title, t.description, t.board_stage, t.plan_status, t.execution_status, t.acceptance_status, t.progress_percent, t.requires_plan_confirmation, (SELECT count(*) FROM tasks child WHERE child.parent_task_id = t.id), t.revision, to_char(t.created_at, 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), to_char(t.updated_at, 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') FROM tasks t WHERE t.project_id = $1 AND ($2::text IS NULL OR t.board_stage = $2) AND ($3::text IS NULL OR t.parent_task_id = $3) ORDER BY t.created_at ASC", &[&project_id, &stage, &parent_id]).await.map_err(ApiError::database)?;
+    let rows = client
+        .query(
+            concat!(
+                "SELECT t.id, t.project_id, t.parent_task_id, t.title, t.description, t.board_stage, t.plan_status, t.execution_status, ",
+                "t.acceptance_status, t.progress_percent, t.requires_plan_confirmation, ",
+                "(SELECT count(*) FROM tasks child WHERE child.parent_task_id = t.id), t.revision, ",
+                "to_char(t.created_at, 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), ",
+                "to_char(t.updated_at, 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), t.collaboration_status FROM tasks t ",
+                "WHERE t.project_id = $1 AND ($2::text IS NULL OR t.board_stage = $2) ",
+                "AND ($3::text IS NULL OR t.parent_task_id = $3) ORDER BY t.created_at ASC"
+            ),
+            &[&project_id, &stage, &parent_id],
+        )
+        .await
+        .map_err(ApiError::database)?;
     Ok(Json(json!({ "items": rows.iter().map(task_json).collect::<Vec<_>>(), "next_cursor": null })))
 }
 
@@ -220,7 +252,19 @@ async fn create_task(State(state): State<AppState>, Path(project_id): Path<Strin
     if transaction.query_opt("SELECT 1 FROM projects WHERE id = $1 AND status = 'active'", &[&project_id]).await.map_err(ApiError::database)?.is_none() { return Err(ApiError::not_found("project not found")); }
     if let Some(parent) = parent_id { if transaction.query_opt("SELECT 1 FROM tasks WHERE id = $1 AND project_id = $2", &[&parent, &project_id]).await.map_err(ApiError::database)?.is_none() { return Err(ApiError::invalid("parent task must belong to the same project")); } }
     let id = Uuid::new_v4().to_string();
-    let row = transaction.query_one("INSERT INTO tasks (id, project_id, parent_task_id, title, description, board_stage, plan_status, execution_status, requires_plan_confirmation) VALUES ($1, $2, $3, $4, $5, 'backlog', CASE WHEN $6 THEN 'pending_generation' ELSE 'not_required' END, 'idle', $6) RETURNING id, project_id, parent_task_id, title, description, board_stage, plan_status, execution_status, acceptance_status, progress_percent, requires_plan_confirmation, (SELECT count(*) FROM tasks child WHERE child.parent_task_id = tasks.id), revision, to_char(created_at, 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), to_char(updated_at, 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')", &[&id, &project_id, &parent_id, &title, &description, &requires]).await.map_err(ApiError::database)?;
+    let row = transaction
+        .query_one(
+            concat!(
+                "INSERT INTO tasks (id, project_id, parent_task_id, title, description, board_stage, plan_status, execution_status, requires_plan_confirmation) ",
+                "VALUES ($1, $2, $3, $4, $5, 'backlog', CASE WHEN $6 THEN 'pending_generation' ELSE 'not_required' END, 'idle', $6) ",
+                "RETURNING id, project_id, parent_task_id, title, description, board_stage, plan_status, execution_status, acceptance_status, ",
+                "progress_percent, requires_plan_confirmation, (SELECT count(*) FROM tasks child WHERE child.parent_task_id = tasks.id), revision, ",
+                "to_char(created_at, 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), to_char(updated_at, 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), collaboration_status"
+            ),
+            &[&id, &project_id, &parent_id, &title, &description, &requires],
+        )
+        .await
+        .map_err(ApiError::database)?;
     transaction.execute("INSERT INTO task_events (task_id, event_type, actor_type, actor_id, after_data) VALUES ($1, 'task.created', 'human', 'human', $2)", &[&id, &json!({ "board_stage": "backlog" })]).await.map_err(ApiError::database)?;
     transaction.commit().await.map_err(ApiError::database)?;
     Ok((StatusCode::CREATED, Json(task_json(&row))))
@@ -229,7 +273,20 @@ async fn create_task(State(state): State<AppState>, Path(project_id): Path<Strin
 /// 查询单个任务及其当前聚合字段。
 async fn get_task(State(state): State<AppState>, Path(task_id): Path<String>) -> Result<Json<Value>, ApiError> {
     let client = connect(&state).await?;
-    let row = client.query_opt("SELECT t.id, t.project_id, t.parent_task_id, t.title, t.description, t.board_stage, t.plan_status, t.execution_status, t.acceptance_status, t.progress_percent, t.requires_plan_confirmation, (SELECT count(*) FROM tasks child WHERE child.parent_task_id = t.id), t.revision, to_char(t.created_at, 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), to_char(t.updated_at, 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') FROM tasks t WHERE t.id = $1", &[&task_id]).await.map_err(ApiError::database)?.ok_or_else(|| ApiError::not_found("task not found"))?;
+    let row = client
+        .query_opt(
+            concat!(
+                "SELECT t.id, t.project_id, t.parent_task_id, t.title, t.description, t.board_stage, t.plan_status, t.execution_status, ",
+                "t.acceptance_status, t.progress_percent, t.requires_plan_confirmation, ",
+                "(SELECT count(*) FROM tasks child WHERE child.parent_task_id = t.id), t.revision, ",
+                "to_char(t.created_at, 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), ",
+                "to_char(t.updated_at, 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), t.collaboration_status FROM tasks t WHERE t.id = $1"
+            ),
+            &[&task_id],
+        )
+        .await
+        .map_err(ApiError::database)?
+        .ok_or_else(|| ApiError::not_found("task not found"))?;
     Ok(Json(task_json(&row)))
 }
 
@@ -244,7 +301,21 @@ async fn update_task(State(state): State<AppState>, Path(task_id): Path<String>,
     if progress.is_some_and(|value| !(0..=100).contains(&value)) { return Err(ApiError::invalid("progress_percent must be between 0 and 100")); }
     let mut client = connect(&state).await?;
     let transaction = client.transaction().await.map_err(ApiError::database)?;
-    let row = transaction.query_opt("UPDATE tasks SET title = COALESCE($2, title), description = COALESCE($3, description), requires_plan_confirmation = COALESCE($4, requires_plan_confirmation), progress_percent = COALESCE($5, progress_percent), revision = revision + 1, updated_at = now() WHERE id = $1 RETURNING id, project_id, parent_task_id, title, description, board_stage, plan_status, execution_status, acceptance_status, progress_percent, requires_plan_confirmation, (SELECT count(*) FROM tasks WHERE parent_task_id = tasks.id), revision, to_char(created_at, 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), to_char(updated_at, 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')", &[&task_id, &title, &description, &requires, &progress]).await.map_err(ApiError::database)?.ok_or_else(|| ApiError::not_found("task not found"))?;
+    let row = transaction
+        .query_opt(
+            concat!(
+                "UPDATE tasks SET title = COALESCE($2, title), description = COALESCE($3, description), ",
+                "requires_plan_confirmation = COALESCE($4, requires_plan_confirmation), progress_percent = COALESCE($5, progress_percent), ",
+                "revision = revision + 1, updated_at = now() WHERE id = $1 RETURNING id, project_id, parent_task_id, title, description, ",
+                "board_stage, plan_status, execution_status, acceptance_status, progress_percent, requires_plan_confirmation, ",
+                "(SELECT count(*) FROM tasks WHERE parent_task_id = tasks.id), revision, ",
+                "to_char(created_at, 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), to_char(updated_at, 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), collaboration_status"
+            ),
+            &[&task_id, &title, &description, &requires, &progress],
+        )
+        .await
+        .map_err(ApiError::database)?
+        .ok_or_else(|| ApiError::not_found("task not found"))?;
     transaction.execute("INSERT INTO task_events (task_id, event_type, actor_type, actor_id, event_data) VALUES ($1, 'task.updated', 'human', 'human', $2)", &[&task_id, &json!({ "updated": true })]).await.map_err(ApiError::database)?;
     transaction.commit().await.map_err(ApiError::database)?;
     Ok(Json(task_json(&row)))
@@ -257,7 +328,14 @@ async fn transition_task(State(state): State<AppState>, Path(task_id): Path<Stri
     let reason = body.get("reason").and_then(Value::as_str).unwrap_or("");
     let mut client = connect(&state).await?;
     let transaction = client.transaction().await.map_err(ApiError::database)?;
-    let current = transaction.query_opt("SELECT board_stage, requires_plan_confirmation, revision FROM tasks WHERE id = $1 FOR UPDATE", &[&task_id]).await.map_err(ApiError::database)?.ok_or_else(|| ApiError::not_found("task not found"))?;
+    let current = transaction
+        .query_opt(
+            "SELECT board_stage, requires_plan_confirmation, revision, project_id FROM tasks WHERE id = $1 FOR UPDATE",
+            &[&task_id],
+        )
+        .await
+        .map_err(ApiError::database)?
+        .ok_or_else(|| ApiError::not_found("task not found"))?;
     let from = current.get::<_, String>(0);
     let from_stage = xiexu_domain::BoardStage::parse(&from).ok_or_else(|| ApiError::invalid("stored task stage is invalid"))?;
     if !xiexu_domain::is_valid_transition(from_stage, target_stage) { return Err(ApiError::conflict(format!("invalid transition: {from} -> {target}"))); }
@@ -274,61 +352,26 @@ async fn transition_task(State(state): State<AppState>, Path(task_id): Path<Stri
         transaction.execute("INSERT INTO execution_jobs (id, kind, status, task_id, payload, dedupe_key) VALUES ($1, 'execute_task', 'queued', $2, $3, $4) ON CONFLICT (dedupe_key) DO NOTHING", &[&Uuid::new_v4().to_string(), &task_id, &json!({ "task_id": task_id.clone(), "reason": reason, "revision": next_revision }), &dedupe_key]).await.map_err(ApiError::database)?;
         transaction.execute("INSERT INTO task_events (task_id, event_type, actor_type, actor_id, event_data) VALUES ($1, 'execution.job_queued', 'system', 'control-plane', $2)", &[&task_id, &json!({ "kind": "execute_task", "dedupe_key": dedupe_key })]).await.map_err(ApiError::database)?;
     }
-    if target_stage == xiexu_domain::BoardStage::Done { transaction.execute("UPDATE tasks SET board_stage = 'done', acceptance_status = 'passed', progress_percent = 100, revision = revision + 1, updated_at = now() WHERE parent_task_id = $1 AND board_stage <> 'cancelled'", &[&task_id]).await.map_err(ApiError::database)?; }
+    if target_stage == xiexu_domain::BoardStage::Done {
+        transaction
+            .execute(
+                concat!(
+                    "UPDATE tasks SET board_stage = 'done', acceptance_status = 'passed', ",
+                    "progress_percent = 100, revision = revision + 1, updated_at = now() ",
+                    "WHERE parent_task_id = $1 AND board_stage <> 'cancelled'",
+                ),
+                &[&task_id],
+            )
+            .await
+            .map_err(ApiError::database)?;
+
+        // 父任务通过通用阶段转换完成时，同事务补建异步文档刷新作业。
+        let next_revision = current.get::<_, i64>(2) + 1;
+        let project_id = current.get::<_, String>(3);
+        project_context::enqueue_parent_document_refresh(&transaction, &task_id, &project_id, next_revision).await?;
+    }
     transaction.commit().await.map_err(ApiError::database)?;
     get_task(State(state), Path(task_id)).await
-}
-
-/// 查询任务评论，评论按追加时间顺序返回。
-async fn list_comments(State(state): State<AppState>, Path(task_id): Path<String>) -> Result<Json<Value>, ApiError> {
-    let client = connect(&state).await?;
-    let rows = client.query("SELECT id, author_type, author_name, content, intent, transition_applied, to_char(created_at, 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') FROM task_comments WHERE task_id = $1 ORDER BY created_at ASC", &[&task_id]).await.map_err(ApiError::database)?;
-    Ok(Json(json!({ "items": rows.iter().map(|row| json!({ "id": row.get::<_, String>(0), "author_type": row.get::<_, String>(1), "author_name": row.get::<_, String>(2), "content": row.get::<_, String>(3), "intent": row.get::<_, String>(4), "transition_applied": row.get::<_, bool>(5), "created_at": row.get::<_, String>(6) })).collect::<Vec<_>>() })))
-}
-
-/// 保存评论事实，并将显式意图提示交给状态机尝试应用；自然语言识别仍留给后续 Agent。
-async fn create_comment(State(state): State<AppState>, Path(task_id): Path<String>, Json(body): Json<Value>) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let content = required_text(&body, "content")?;
-    let intent = body.get("intent").and_then(Value::as_str).unwrap_or("note");
-    let allowed = ["note", "approve_plan", "reject_plan", "accept", "rework", "mention"];
-    if !allowed.contains(&intent) { return Err(ApiError::invalid("unsupported intent hint")); }
-    let mut client = connect(&state).await?;
-    let transaction = client.transaction().await.map_err(ApiError::database)?;
-    let current = transaction.query_opt("SELECT board_stage, revision FROM tasks WHERE id = $1 FOR UPDATE", &[&task_id]).await.map_err(ApiError::database)?.ok_or_else(|| ApiError::not_found("task not found"))?;
-    let current_stage = current.get::<_, String>(0);
-    let current_revision = current.get::<_, i64>(1);
-    let mut applied = false;
-    let comment_id = Uuid::new_v4().to_string();
-    let current_stage_value = xiexu_domain::BoardStage::parse(&current_stage).ok_or_else(|| ApiError::invalid("stored task stage is invalid"))?;
-    let mut next_stage = None;
-    if intent == "approve_plan" && current_stage_value == xiexu_domain::BoardStage::PlanReview {
-        next_stage = Some(xiexu_domain::BoardStage::InProgress);
-    } else if intent == "accept" && current_stage_value == xiexu_domain::BoardStage::Acceptance {
-        next_stage = Some(xiexu_domain::BoardStage::Done);
-    } else if intent == "rework" && current_stage_value == xiexu_domain::BoardStage::Acceptance {
-        next_stage = Some(xiexu_domain::BoardStage::InProgress);
-    }
-    if let Some(target_stage) = next_stage {
-        let next_revision = current_revision + 1;
-        let next_plan_status = if target_stage == xiexu_domain::BoardStage::InProgress { "approved" } else { "not_required" };
-        let next_execution_status = if target_stage == xiexu_domain::BoardStage::InProgress { "queued" } else { "idle" };
-        let next_acceptance_status = if target_stage == xiexu_domain::BoardStage::Done { "passed" } else { "not_started" };
-        transaction.execute("UPDATE tasks SET board_stage = $2, plan_status = $3, execution_status = $4, acceptance_status = $5, progress_percent = CASE WHEN $2 = 'done' THEN 100 ELSE progress_percent END, revision = revision + 1, updated_at = now() WHERE id = $1", &[&task_id, &target_stage.as_str(), &next_plan_status, &next_execution_status, &next_acceptance_status]).await.map_err(ApiError::database)?;
-        transaction.execute("INSERT INTO task_transitions (id, task_id, from_stage, to_stage, reason) VALUES ($1, $2, $3, $4, $5)", &[&Uuid::new_v4().to_string(), &task_id, &current_stage, &target_stage.as_str(), &format!("comment:{intent}")]).await.map_err(ApiError::database)?;
-        transaction.execute("INSERT INTO task_events (task_id, event_type, actor_type, actor_id, before_data, after_data, event_data) VALUES ($1, 'task.stage_changed', 'human', 'human', $2, $3, $4)", &[&task_id, &json!({ "board_stage": current_stage.clone() }), &json!({ "board_stage": target_stage.as_str() }), &json!({ "reason": format!("comment:{intent}"), "comment_id": comment_id.clone() })]).await.map_err(ApiError::database)?;
-        if target_stage == xiexu_domain::BoardStage::Done {
-            transaction.execute("UPDATE tasks SET board_stage = 'done', acceptance_status = 'passed', progress_percent = 100, revision = revision + 1, updated_at = now() WHERE parent_task_id = $1 AND board_stage <> 'cancelled'", &[&task_id]).await.map_err(ApiError::database)?;
-        } else {
-            let dedupe_key = format!("task:{task_id}:execute:{next_revision}");
-            transaction.execute("INSERT INTO execution_jobs (id, kind, status, task_id, payload, dedupe_key) VALUES ($1, 'execute_task', 'queued', $2, $3, $4) ON CONFLICT (dedupe_key) DO NOTHING", &[&Uuid::new_v4().to_string(), &task_id, &json!({ "task_id": task_id.clone(), "reason": format!("comment:{intent}"), "revision": next_revision, "comment_id": comment_id.clone() }), &dedupe_key]).await.map_err(ApiError::database)?;
-            transaction.execute("INSERT INTO task_events (task_id, event_type, actor_type, actor_id, event_data) VALUES ($1, 'execution.job_queued', 'system', 'control-plane', $2)", &[&task_id, &json!({ "kind": "execute_task", "dedupe_key": dedupe_key })]).await.map_err(ApiError::database)?;
-        }
-        applied = true;
-    }
-    transaction.execute("INSERT INTO task_comments (id, task_id, author_type, author_name, content, intent, transition_applied) VALUES ($1, $2, 'human', 'Human', $3, $4, $5)", &[&comment_id, &task_id, &content, &intent, &applied]).await.map_err(ApiError::database)?;
-    transaction.execute("INSERT INTO task_events (task_id, event_type, actor_type, actor_id, event_data) VALUES ($1, 'task.comment_added', 'human', 'human', $2)", &[&task_id, &json!({ "comment_id": comment_id, "intent": intent })]).await.map_err(ApiError::database)?;
-    transaction.commit().await.map_err(ApiError::database)?;
-    Ok((StatusCode::CREATED, Json(json!({ "id": comment_id, "task_id": task_id, "intent": intent, "transition_applied": applied }))))
 }
 
 /// 查询任务时间线事件，供后续运行记录和 Agent 上下文复用。

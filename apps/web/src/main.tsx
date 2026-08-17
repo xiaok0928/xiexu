@@ -19,6 +19,8 @@ type TaskCard = {
   progress_percent: number;
   requires_plan_confirmation: boolean;
   children_count: number;
+  /** 是否存在尚未解除的结构化协作请求。 */
+  collaboration_status: "ready" | "waiting";
   revision: number;
 };
 /** 内置 Agent 角色模板。 */
@@ -35,6 +37,137 @@ type Conversation = { id: string; conversation_type: string; project_id?: string
 type Message = { id: string; author_type: string; author_id: string; content: string; message_type: string; task_id?: string };
 /** 任务详情需要展示的执行输出与事件摘要。 */
 type ExecutionSnapshot = { outputs: Array<{ id: string; output_type: string; content: string }>; events: Array<{ id: number; event_type: string }> };
+/** 评论中的结构化提及及其解除状态。 */
+type TaskMention = {
+  /** 提及事实主键。 */
+  id: string;
+  /** 接收目标的实体类型。 */
+  target_type: "task" | "agent";
+  /** 接收任务或 Agent 的稳定主键。 */
+  target_id: string;
+  /** 服务端解析的可读目标名称。 */
+  target_name?: string | null;
+  /** 提及当前是否已解除。 */
+  status: string;
+  /** 相对当前任务的提及方向。 */
+  direction?: "outgoing" | "incoming";
+  /** 发出提及的任务主键。 */
+  source_task_id?: string | null;
+  /** 发出提及的任务名称。 */
+  source_task_title?: string | null;
+  /** 解除提及的评论主键。 */
+  resolved_by_comment_id?: string | null;
+};
+/** 任务评论及其父评论和提及关系。 */
+type TaskComment = {
+  /** 评论事实主键。 */
+  id: string;
+  /** 当前评论直接回复的父评论。 */
+  parent_comment_id?: string | null;
+  /** 评论作者显示名。 */
+  author_name: string;
+  /** 评论正文。 */
+  content: string;
+  /** 显式状态机意图。 */
+  intent: string;
+  /** 由当前评论创建的结构化提及。 */
+  mentions: TaskMention[];
+};
+/** 项目文档列表项及其待处理变更聚合。 */
+type ProjectDocumentSummary = {
+  /** 文档主键。 */
+  id: string;
+  /** 归属项目主键。 */
+  project_id: string;
+  /** 稳定文档类型。 */
+  doc_type: string;
+  /** 文档标题。 */
+  title: string;
+  /** 文档聚合修订号。 */
+  revision: number;
+  /** 当前不可变版本号。 */
+  current_version_no: number;
+  /** 文档生命周期状态。 */
+  status: string;
+  /** 当前章节数量。 */
+  section_count: number;
+  /** 待处理或冲突候选数量。 */
+  pending_candidate_count: number;
+  /** 最近一次后台刷新完成时间。 */
+  last_refreshed_at?: string | null;
+  /** 文档聚合更新时间。 */
+  updated_at: string;
+};
+/** 可独立编辑和锁定的项目文档章节。 */
+type DocumentSection = {
+  /** 章节稳定业务键。 */
+  section_key: string;
+  /** 章节标题。 */
+  title: string;
+  /** 当前正文内容。 */
+  content: string;
+  /** 文档内展示顺序。 */
+  sort_order: number;
+  /** Human 是否禁止自动覆盖。 */
+  locked_by_human: boolean;
+  /** 章节并发修订号。 */
+  revision: number;
+  /** 章节事实更新时间。 */
+  updated_at: string;
+};
+/** 文档候选变更，Human 明确处置前不会覆盖当前章节。 */
+type DocumentCandidate = {
+  /** 候选事实主键。 */
+  id: string;
+  /** 建议更新的章节键。 */
+  section_key: string;
+  /** 建议替换的完整正文。 */
+  proposed_content: string;
+  /** 候选变更来源类型。 */
+  source_type: string;
+  /** 来源任务或作业主键。 */
+  source_id?: string | null;
+  /** 生成候选时的章节修订号。 */
+  base_section_revision: number;
+  /** 候选当前处置状态。 */
+  status: string;
+  /** 无法直接应用时的冲突原因。 */
+  conflict_reason?: string;
+  /** 候选生成时间。 */
+  created_at: string;
+  /** 候选完成处置的时间。 */
+  resolved_at?: string | null;
+};
+/** 项目文档当前事实及其章节、候选更新。 */
+type ProjectDocument = Omit<ProjectDocumentSummary, "section_count" | "pending_candidate_count"> & { sections: DocumentSection[]; candidates: DocumentCandidate[] };
+/** 不可变文档版本的审计摘要。 */
+type DocumentVersion = {
+  /** 版本事实主键。 */
+  id: string;
+  /** 文档内单调递增版本号。 */
+  version_no: number;
+  /** 用于审计的快照内容哈希。 */
+  content_hash: string;
+  /** 版本生成来源。 */
+  source_type: string;
+  /** 创建版本的主体主键。 */
+  created_by_actor_id: string;
+  /** 触发版本的任务主键。 */
+  source_task_id?: string | null;
+  /** 回退操作引用的历史版本号。 */
+  rollback_from_version_no?: number | null;
+  /** 版本创建时间。 */
+  created_at: string;
+};
+/** 章节级文档版本差异。 */
+type DocumentDiff = {
+  /** 差异基线版本。 */
+  from: number;
+  /** 差异目标版本。 */
+  to: number;
+  /** 仅包含实际变化章节的前后快照。 */
+  changes: Array<{ section_key: string; change_type: string; before?: DocumentSection | null; after?: DocumentSection | null }>;
+};
 
 const stages = ["backlog", "todo", "plan_review", "in_progress", "acceptance"];
 const stageLabels: Record<string, string> = { backlog: "Backlog", todo: "Todo", plan_review: "方案待确认", in_progress: "处理中", acceptance: "等待验收" };
@@ -288,47 +421,122 @@ function Board({
             </section>
           ))}
         </div>
-        {selectedTask ? <TaskDetail task={selectedTask} onReload={onReload} /> : <div className="detail">选择任务查看详情</div>}
+        {selectedTask ? (
+          <TaskDetail task={selectedTask} projectTasks={tasks} onReload={onReload} onError={onError} />
+        ) : (
+          <div className="detail">选择任务查看详情</div>
+        )}
       </div>
     </section>
   );
 }
 
-/** 任务详情：展示主责 Agent、运行输出和评论状态流转。 */
-function TaskDetail({ task, onReload }: { task: TaskCard; onReload: () => Promise<void> }) {
-  const [comments, setComments] = useState<Array<{ id: string; author_name: string; content: string; intent: string }>>([]);
+/** 任务详情：展示运行事实，并通过结构化评论维护提及、回复和解除关系。 */
+function TaskDetail({
+  task,
+  projectTasks,
+  onReload,
+  onError,
+}: {
+  task: TaskCard;
+  projectTasks: TaskCard[];
+  onReload: () => Promise<void>;
+  onError: (message: string) => void;
+}) {
+  const [comments, setComments] = useState<TaskComment[]>([]);
   const [execution, setExecution] = useState<ExecutionSnapshot>({ outputs: [], events: [] });
   const [agents, setAgents] = useState<Array<{ agent_id: string; name: string; participation_type: string; status: string }>>([]);
+  const [projectAgents, setProjectAgents] = useState<ProjectAgent[]>([]);
+  const [taskMentions, setTaskMentions] = useState<TaskMention[]>([]);
   const [content, setContent] = useState("");
   const [intent, setIntent] = useState("note");
+  const [mentionType, setMentionType] = useState<"" | "agent" | "task">("");
+  const [mentionTargetId, setMentionTargetId] = useState("");
+  const [parentCommentId, setParentCommentId] = useState("");
+  const [resolvesMentionId, setResolvesMentionId] = useState("");
 
   /** 并行加载任务详情事实。 */
   async function load() {
-    // 三类数据彼此独立，合并等待后一次刷新界面。
-    const [commentResult, executionResult, agentResult] = await Promise.all([
+    // 评论、运行、参与者、项目成员和提及彼此独立，合并等待后一次刷新界面。
+    const [commentResult, executionResult, agentResult, projectAgentResult, mentionResult] = await Promise.all([
       api<{ items: typeof comments }>(`/api/tasks/${task.id}/comments`),
       api<ExecutionSnapshot>(`/api/tasks/${task.id}/execution`),
       api<{ items: typeof agents }>(`/api/tasks/${task.id}/agents`),
+      api<{ items: ProjectAgent[] }>(`/api/projects/${task.project_id}/agents`),
+      api<{ items: TaskMention[] }>(`/api/tasks/${task.id}/mentions`),
     ]);
     setComments(commentResult.items);
     setExecution(executionResult);
     setAgents(agentResult.items);
+    setProjectAgents(projectAgentResult.items.filter((item) => item.assignment_status === "active"));
+    setTaskMentions(mentionResult.items);
   }
   useEffect(() => {
-    void load();
+    // 切换任务时清理上一任务的回复上下文，避免关系误提交到新任务。
+    setParentCommentId("");
+    setResolvesMentionId("");
+    setMentionType("");
+    setMentionTargetId("");
+    void load().catch((cause) => onError(cause instanceof Error ? cause.message : "任务详情加载失败"));
   }, [task.id, task.revision]);
 
-  /** 发送带显式意图提示的任务评论。 */
+  /** 发送带显式意图、提及、父评论和解除目标的任务评论。 */
   async function send() {
-    // 空内容不写入事实源，成功后同步任务和详情。
+    // 空内容不写入事实源；提及目标必须完整选择，不能依赖正文解析。
     if (!content.trim()) return;
-    await api(`/api/tasks/${task.id}/comments`, { method: "POST", body: JSON.stringify({ content: content.trim(), intent }) });
-    setContent("");
-    await onReload();
-    await load();
+    if (mentionType && !mentionTargetId) return;
+
+    // 关系字段只在用户显式选择时提交，服务端在一个事务中维护等待状态。
+    try {
+      await api(`/api/tasks/${task.id}/comments`, {
+        method: "POST",
+        body: JSON.stringify({
+          content: content.trim(),
+          intent: mentionType && intent === "note" ? "mention" : intent,
+          parent_comment_id: parentCommentId || undefined,
+          mentions: mentionType && mentionTargetId ? [{ target_type: mentionType, target_id: mentionTargetId }] : [],
+          resolves_mention_id: resolvesMentionId || undefined,
+        }),
+      });
+
+      // 成功后清空一次性关系选择，并同步任务聚合和评论事实。
+      setContent("");
+      setMentionType("");
+      setMentionTargetId("");
+      setParentCommentId("");
+      setResolvesMentionId("");
+      await onReload();
+      await load();
+    } catch (cause) {
+      onError(cause instanceof Error ? cause.message : "评论发送失败");
+    }
   }
 
+  /** 选择父评论作为回复上下文。 */
+  function replyTo(commentId: string) {
+    // 解除提及回复会同时关联原评论，普通回复只建立父子关系。
+    setParentCommentId(commentId);
+    setContent((current) => current || "回复：");
+  }
+
+  /** 选择一个待处理提及，并准备通过新评论显式解除。 */
+  function resolveMention(mention: TaskMention, commentId?: string) {
+    // 只有当前任务发出的 pending 提及可由该评论接口解除。
+    if (mention.status !== "pending" || mention.direction === "incoming") return;
+    setResolvesMentionId(mention.id);
+    setParentCommentId(commentId ?? "");
+    setContent((current) => current || "已处理：");
+  }
+
+  // 主责参与者和当前回复对象只从已加载事实中派生，不维护重复状态。
   const owner = agents.find((item) => item.participation_type === "owner" && item.status === "active");
+  const parentComment = comments.find((item) => item.id === parentCommentId);
+  const resolvingMention =
+    taskMentions.find((item) => item.id === resolvesMentionId) ?? comments.flatMap((item) => item.mentions).find((item) => item.id === resolvesMentionId);
+  const mentionTargets =
+    mentionType === "agent"
+      ? projectAgents.map((item) => ({ id: item.agent_id, label: item.name }))
+      : projectTasks.filter((item) => item.id !== task.id).map((item) => ({ id: item.id, label: item.title }));
   return (
     <aside className="detail">
       <small>{task.id}</small>
@@ -338,6 +546,10 @@ function TaskDetail({ task, onReload }: { task: TaskCard; onReload: () => Promis
         <b>{stageLabels[task.board_stage]}</b>
         <span>执行</span>
         <b>{task.execution_status}</b>
+        <span>协作</span>
+        <b className={task.collaboration_status === "waiting" ? "status-waiting" : "status-ready"}>
+          {task.collaboration_status === "waiting" ? "等待协作" : "可继续"}
+        </b>
         <span>主责 Agent</span>
         <b>{owner?.name ?? "等待协调"}</b>
         <span>进度</span>
@@ -355,15 +567,47 @@ function TaskDetail({ task, onReload }: { task: TaskCard; onReload: () => Promis
       </div>
       <h3>评论</h3>
       <div className="comment-list">
-        {comments.map((item) => (
-          <div className="comment" key={item.id}>
-            <b>
-              {item.author_name} · {item.intent}
-            </b>
-            <p>{item.content}</p>
-          </div>
-        ))}
+        {comments.map((item) => {
+          const parent = comments.find((candidate) => candidate.id === item.parent_comment_id);
+          return (
+            <div className={item.parent_comment_id ? "comment reply-comment" : "comment"} key={item.id}>
+              <div className="comment-head">
+                <b>
+                  {item.author_name} · {item.intent}
+                </b>
+                <button className="inline-action" onClick={() => replyTo(item.id)}>回复</button>
+              </div>
+              {parent && <small className="reply-reference">回复 {parent.author_name}：{parent.content}</small>}
+              <p>{item.content}</p>
+              {!!item.mentions?.length && (
+                <div className="mention-list">
+                  {item.mentions.map((mention) => (
+                    <span className={`mention-chip ${mention.status}`} key={mention.id}>
+                      @{mention.target_name ?? mention.target_id.slice(0, 8)} · {mention.status}
+                      {mention.status === "pending" && <button title="通过回复解除提及" onClick={() => resolveMention(mention, item.id)}>✓</button>}
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        })}
+        {!comments.length && <p className="muted">暂无评论</p>}
       </div>
+      {(parentComment || resolvingMention) && (
+        <div className="reply-context">
+          <span>{resolvingMention ? `解除 @${resolvingMention.target_name ?? resolvingMention.target_id.slice(0, 8)}` : `回复 ${parentComment?.author_name}`}</span>
+          <button
+            title="清除回复关系"
+            onClick={() => {
+              setParentCommentId("");
+              setResolvesMentionId("");
+            }}
+          >
+            ×
+          </button>
+        </div>
+      )}
       <div className="comment-input">
         <input value={content} onChange={(event) => setContent(event.target.value)} placeholder="输入评论" />
         <select value={intent} onChange={(event) => setIntent(event.target.value)}>
@@ -373,6 +617,23 @@ function TaskDetail({ task, onReload }: { task: TaskCard; onReload: () => Promis
           <option value="rework">返工</option>
         </select>
         <button onClick={() => void send()}>发送</button>
+      </div>
+      <div className="mention-picker">
+        <select
+          value={mentionType}
+          onChange={(event) => {
+            setMentionType(event.target.value as "" | "agent" | "task");
+            setMentionTargetId("");
+          }}
+        >
+          <option value="">不提及</option>
+          <option value="agent">@Agent</option>
+          <option value="task">@任务</option>
+        </select>
+        <select value={mentionTargetId} disabled={!mentionType} onChange={(event) => setMentionTargetId(event.target.value)}>
+          <option value="">选择目标</option>
+          {mentionTargets.map((target) => <option key={target.id} value={target.id}>{target.label}</option>)}
+        </select>
       </div>
     </aside>
   );
@@ -623,6 +884,7 @@ function ProjectSpace({ project, onReload, onError }: { project: Project; onRelo
   const [agents, setAgents] = useState<Agent[]>([]);
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [selectedId, setSelectedId] = useState("");
+  const [projectMode, setProjectMode] = useState<"collaboration" | "documents">("collaboration");
 
   /** 加载项目协作关系。 */
   async function load() {
@@ -689,52 +951,336 @@ function ProjectSpace({ project, onReload, onError }: { project: Project; onRelo
           <small>项目对话</small>
         </div>
       </div>
-      <div className="project-grid">
-        <aside className="panel project-members">
-          <div className="panel-head">
-            <h3>项目 Agent</h3>
-            <button className="icon-action" onClick={() => void addMember()}>
-              ＋
-            </button>
+      <div className="project-mode-switch" role="tablist" aria-label="项目空间视图">
+        <button className={projectMode === "collaboration" ? "active" : ""} onClick={() => setProjectMode("collaboration")}>协作</button>
+        <button className={projectMode === "documents" ? "active" : ""} onClick={() => setProjectMode("documents")}>项目文档</button>
+      </div>
+      {projectMode === "collaboration" ? (
+        <div className="project-grid">
+          <aside className="panel project-members">
+            <div className="panel-head">
+              <h3>项目 Agent</h3>
+              <button className="icon-action" title="添加项目 Agent" onClick={() => void addMember()}>＋</button>
+            </div>
+            {members.map((member) => (
+              <div className="member-row" key={member.agent_id}>
+                <span className="agent-avatar">{member.name.slice(0, 1)}</span>
+                <span>
+                  <b>{member.name}</b>
+                  <small>{member.assignment_type === "coordinator" ? "协调 Agent" : "固定 Agent"}</small>
+                </span>
+              </div>
+            ))}
+          </aside>
+          <aside className="panel conversation-list">
+            <div className="panel-head">
+              <h3>项目对话</h3>
+              <button className="icon-action" title="创建临时群聊" onClick={() => void createGroup()}>＋</button>
+            </div>
+            {conversations.map((item) => (
+              <button key={item.id} className={item.id === selectedId ? "conversation-row active" : "conversation-row"} onClick={() => setSelectedId(item.id)}>
+                <b>{item.title}</b>
+                <small>{item.conversation_type === "project_main" ? "主群聊" : "临时群聊"} · {item.status}</small>
+              </button>
+            ))}
+          </aside>
+          {selectedId && (
+            <ConversationPanel
+              conversationId={selectedId}
+              project={project}
+              onChanged={async () => {
+                // 项目对话变更后同步对话目录与全局任务聚合。
+                await load();
+                await onReload();
+              }}
+            />
+          )}
+        </div>
+      ) : (
+        <ProjectDocuments project={project} onError={onError} />
+      )}
+    </section>
+  );
+}
+
+/** 项目文档工作区：维护章节事实、版本历史、差异、回退和候选变更。 */
+function ProjectDocuments({ project, onError }: { project: Project; onError: (message: string) => void }) {
+  const [documents, setDocuments] = useState<ProjectDocumentSummary[]>([]);
+  const [selectedDocumentId, setSelectedDocumentId] = useState("");
+  const [document, setDocument] = useState<ProjectDocument>();
+  const [versions, setVersions] = useState<DocumentVersion[]>([]);
+  const [candidates, setCandidates] = useState<DocumentCandidate[]>([]);
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [diffFrom, setDiffFrom] = useState("");
+  const [diffTo, setDiffTo] = useState("");
+  const [diff, setDiff] = useState<DocumentDiff>();
+  const [notice, setNotice] = useState("");
+
+  /** 加载项目文档目录并保留有效选择。 */
+  async function loadDocuments() {
+    // 项目切换时目录是选择源，空目录不伪造默认文档。
+    const result = await api<{ items: ProjectDocumentSummary[] }>(`/api/projects/${project.id}/documents`);
+    setDocuments(result.items);
+    setSelectedDocumentId((current) => (result.items.some((item) => item.id === current) ? current : (result.items[0]?.id ?? "")));
+  }
+
+  /** 加载当前文档、不可变版本和候选变更。 */
+  async function loadDocument(documentId: string) {
+    // 当前详情、不可变版本与候选处置状态独立读取，合并等待后一次性更新界面。
+    const [detail, versionResult, candidateResult] = await Promise.all([
+      api<ProjectDocument>(`/api/documents/${documentId}`),
+      api<{ items: DocumentVersion[] }>(`/api/documents/${documentId}/versions`),
+      api<{ items: DocumentCandidate[] }>(`/api/documents/${documentId}/candidates`),
+    ]);
+
+    // 所有远端事实成功读取后一次性替换本地视图和编辑草稿。
+    setDocument(detail);
+    setVersions(versionResult.items);
+    setCandidates(candidateResult.items);
+    setDrafts(Object.fromEntries(detail.sections.map((section) => [section.section_key, section.content])));
+    setDiff(undefined);
+    setDiffFrom((current) => (versionResult.items.some((item) => String(item.version_no) === current) ? current : String(versionResult.items[1]?.version_no ?? "")));
+    setDiffTo((current) => (versionResult.items.some((item) => String(item.version_no) === current) ? current : String(versionResult.items[0]?.version_no ?? "")));
+  }
+
+  useEffect(() => {
+    // 项目切换后重新建立文档目录，不沿用其他项目的选择。
+    setSelectedDocumentId("");
+    setDocument(undefined);
+    void loadDocuments().catch((cause) => onError(cause instanceof Error ? cause.message : "项目文档加载失败"));
+  }, [project.id]);
+  useEffect(() => {
+    // 文档选择变化时同步完整内容和审计信息。
+    if (!selectedDocumentId) return;
+    void loadDocument(selectedDocumentId).catch((cause) => onError(cause instanceof Error ? cause.message : "文档详情加载失败"));
+  }, [selectedDocumentId]);
+
+  /** 保存 Human 对章节正文的显式编辑。 */
+  async function saveSection(section: DocumentSection) {
+    // 详情缺失或正文未改变时不生成无意义版本。
+    if (!document) return;
+    const content = drafts[section.section_key] ?? "";
+    if (content === section.content) return;
+
+    // 服务端更新成功后再替换本地事实，避免并发冲突时展示未提交内容。
+    try {
+      await api(`/api/documents/${document.id}/sections/${encodeURIComponent(section.section_key)}`, { method: "PATCH", body: JSON.stringify({ content }) });
+      setNotice(`${section.title} 已保存`);
+      await loadDocument(document.id);
+      await loadDocuments();
+    } catch (cause) {
+      onError(cause instanceof Error ? cause.message : "章节保存失败");
+    }
+  }
+
+  /** 锁定或解锁章节，控制自动刷新是否可以直接覆盖。 */
+  async function toggleSectionLock(section: DocumentSection) {
+    // 详情缺失时不发请求；锁定状态由服务端写入版本，前端不做乐观覆盖。
+    if (!document) return;
+    try {
+      await api(`/api/documents/${document.id}/sections/${encodeURIComponent(section.section_key)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ locked_by_human: !section.locked_by_human }),
+      });
+      setNotice(section.locked_by_human ? `${section.title} 已解锁` : `${section.title} 已锁定`);
+      await loadDocument(document.id);
+      await loadDocuments();
+    } catch (cause) {
+      onError(cause instanceof Error ? cause.message : "章节锁定更新失败");
+    }
+  }
+
+  /** 手动请求后台刷新当前文档。 */
+  async function refreshDocument() {
+    // 刷新为异步作业，成功只表示已入队，不伪装为内容已更新。
+    if (!document) return;
+    try {
+      await api(`/api/documents/${document.id}/refresh`, { method: "POST", body: "{}" });
+      setNotice("文档刷新已进入队列");
+    } catch (cause) {
+      onError(cause instanceof Error ? cause.message : "文档刷新失败");
+    }
+  }
+
+  /** 比较两个不可变版本并展示章节级差异。 */
+  async function compareVersions() {
+    // 版本必须完整且不同，避免服务端返回无意义差异。
+    if (!document || !diffFrom || !diffTo || diffFrom === diffTo) return;
+    try {
+      const result = await api<DocumentDiff>(`/api/documents/${document.id}/diff?from=${encodeURIComponent(diffFrom)}&to=${encodeURIComponent(diffTo)}`);
+      setDiff(result);
+    } catch (cause) {
+      onError(cause instanceof Error ? cause.message : "版本对比失败");
+    }
+  }
+
+  /** 将历史版本恢复为新的当前版本。 */
+  async function rollback(versionNo: number) {
+    // 二次确认明确回退会生成新版本，不删除后续审计历史。
+    if (!document || !window.confirm(`将版本 v${versionNo} 恢复为新的当前版本？`)) return;
+    try {
+      await api(`/api/documents/${document.id}/rollback`, { method: "POST", body: JSON.stringify({ version_no: versionNo }) });
+      setNotice(`已从 v${versionNo} 创建回退版本`);
+      await loadDocument(document.id);
+      await loadDocuments();
+    } catch (cause) {
+      onError(cause instanceof Error ? cause.message : "版本回退失败");
+    }
+  }
+
+  /** 接受或拒绝一条待处理候选变更。 */
+  async function resolveCandidate(candidate: DocumentCandidate, action: "accept" | "reject") {
+    // 候选处置由专用接口执行，锁定冲突和过期基线仍以服务端判断为准。
+    if (!document) return;
+    try {
+      await api(`/api/document-candidates/${candidate.id}/resolve`, { method: "POST", body: JSON.stringify({ action }) });
+      setNotice(action === "accept" ? "候选变更已采用" : "候选变更已拒绝");
+      await loadDocument(document.id);
+      await loadDocuments();
+    } catch (cause) {
+      onError(cause instanceof Error ? cause.message : "候选变更处置失败");
+    }
+  }
+
+  return (
+    <div className="project-documents">
+      <aside className="panel document-list-panel">
+        <div className="panel-head">
+          <div>
+            <small>项目上下文</small>
+            <h3>文档</h3>
           </div>
-          {members.map((member) => (
-            <div className="member-row" key={member.agent_id}>
-              <span className="agent-avatar">{member.name.slice(0, 1)}</span>
+          <span className="count">{documents.length}</span>
+        </div>
+        <div className="document-list">
+          {documents.map((item) => (
+            <button key={item.id} className={item.id === selectedDocumentId ? "document-row active" : "document-row"} onClick={() => setSelectedDocumentId(item.id)}>
               <span>
-                <b>{member.name}</b>
-                <small>{member.assignment_type === "coordinator" ? "协调 Agent" : "固定 Agent"}</small>
+                <b>{item.title}</b>
+                <small>v{item.current_version_no} · {item.section_count} 个章节</small>
               </span>
+              {!!item.pending_candidate_count && <span className="candidate-count">{item.pending_candidate_count}</span>}
+            </button>
+          ))}
+          {!documents.length && <p className="muted empty-state">暂无项目文档</p>}
+        </div>
+      </aside>
+      <main className="panel document-content-panel">
+        {document ? (
+          <>
+            <div className="document-head">
+              <div>
+                <small>{document.doc_type} · 当前 v{document.current_version_no}</small>
+                <h2>{document.title}</h2>
+                <p>更新于 {new Date(document.updated_at).toLocaleString()}</p>
+              </div>
+              <button className="icon-action" title="请求后台刷新" aria-label="请求后台刷新" onClick={() => void refreshDocument()}>↻</button>
+            </div>
+            {notice && <div className="notice-bar">{notice}</div>}
+            <div className="document-sections">
+              {document.sections.map((section) => (
+                <section className="document-section" key={section.section_key}>
+                  <div className="document-section-head">
+                    <div>
+                      <small>{section.section_key} · r{section.revision}</small>
+                      <h3>{section.title}</h3>
+                    </div>
+                    <button className={section.locked_by_human ? "lock-action locked" : "lock-action"} onClick={() => void toggleSectionLock(section)}>
+                      {section.locked_by_human ? "▣ 解锁" : "□ 锁定"}
+                    </button>
+                  </div>
+                  <textarea
+                    value={drafts[section.section_key] ?? ""}
+                    onChange={(event) => setDrafts((current) => ({ ...current, [section.section_key]: event.target.value }))}
+                  />
+                  <div className="section-actions">
+                    <small>{section.locked_by_human ? "Human 已锁定，自动刷新将生成候选变更" : "自动刷新可更新此章节"}</small>
+                    <button disabled={(drafts[section.section_key] ?? "") === section.content} onClick={() => void saveSection(section)}>保存</button>
+                  </div>
+                </section>
+              ))}
+            </div>
+            <section className="candidate-section">
+              <div className="subsection-head">
+                <h3>候选变更</h3>
+                <span className="count">{candidates.filter((item) => item.status === "pending" || item.status === "conflict").length}</span>
+              </div>
+              {candidates.map((candidate) => (
+                <div className="candidate-row" key={candidate.id}>
+                  <div className="candidate-meta">
+                    <b>{document.sections.find((section) => section.section_key === candidate.section_key)?.title ?? candidate.section_key}</b>
+                    <small>{candidate.source_type} · 基于 r{candidate.base_section_revision} · {candidate.status}</small>
+                  </div>
+                  {candidate.conflict_reason && <p className="candidate-conflict">{candidate.conflict_reason}</p>}
+                  <p>{candidate.proposed_content}</p>
+                  {(candidate.status === "pending" || candidate.status === "conflict") && (
+                    <div className="candidate-actions">
+                      <button onClick={() => void resolveCandidate(candidate, "reject")}>拒绝</button>
+                      <button className="primary-inline" onClick={() => void resolveCandidate(candidate, "accept")}>采用</button>
+                    </div>
+                  )}
+                </div>
+              ))}
+              {!candidates.length && <p className="muted empty-state">暂无候选变更</p>}
+            </section>
+          </>
+        ) : (
+          <p className="muted empty-state">选择文档查看章节</p>
+        )}
+      </main>
+      <aside className="panel document-history-panel">
+        <div className="panel-head">
+          <div>
+            <small>不可变快照</small>
+            <h3>版本历史</h3>
+          </div>
+          <span className="count">{versions.length}</span>
+        </div>
+        <div className="diff-controls">
+          <label>
+            从
+            <select value={diffFrom} onChange={(event) => setDiffFrom(event.target.value)}>
+              <option value="">选择</option>
+              {versions.map((item) => <option key={item.id} value={item.version_no}>v{item.version_no}</option>)}
+            </select>
+          </label>
+          <label>
+            到
+            <select value={diffTo} onChange={(event) => setDiffTo(event.target.value)}>
+              <option value="">选择</option>
+              {versions.map((item) => <option key={item.id} value={item.version_no}>v{item.version_no}</option>)}
+            </select>
+          </label>
+          <button disabled={!diffFrom || !diffTo || diffFrom === diffTo} onClick={() => void compareVersions()}>比较</button>
+        </div>
+        {diff && (
+          <div className="diff-result">
+            <small>v{diff.from} → v{diff.to}</small>
+            {diff.changes.map((change) => (
+              <div className="diff-change" key={change.section_key}>
+                <b>{change.section_key} · {change.change_type}</b>
+                {change.before && <p className="diff-before">− {change.before.content}</p>}
+                {change.after && <p className="diff-after">＋ {change.after.content}</p>}
+              </div>
+            ))}
+            {!diff.changes.length && <p className="muted">所选版本无章节变化</p>}
+          </div>
+        )}
+        <div className="version-list">
+          {versions.map((version) => (
+            <div className="version-row" key={version.id}>
+              <div>
+                <b>v{version.version_no}</b>
+                <small>{version.source_type} · {new Date(version.created_at).toLocaleString()}</small>
+              </div>
+              <button disabled={version.version_no === document?.current_version_no} title="回退到此版本" onClick={() => void rollback(version.version_no)}>
+                ↶
+              </button>
             </div>
           ))}
-        </aside>
-        <aside className="panel conversation-list">
-          <div className="panel-head">
-            <h3>项目对话</h3>
-            <button className="icon-action" onClick={() => void createGroup()}>
-              ＋
-            </button>
-          </div>
-          {conversations.map((item) => (
-            <button key={item.id} className={item.id === selectedId ? "conversation-row active" : "conversation-row"} onClick={() => setSelectedId(item.id)}>
-              <b>{item.title}</b>
-              <small>
-                {item.conversation_type === "project_main" ? "主群聊" : "临时群聊"} · {item.status}
-              </small>
-            </button>
-          ))}
-        </aside>
-        {selectedId && (
-          <ConversationPanel
-            conversationId={selectedId}
-            project={project}
-            onChanged={async () => {
-              await load();
-              await onReload();
-            }}
-          />
-        )}
-      </div>
-    </section>
+        </div>
+      </aside>
+    </div>
   );
 }
 

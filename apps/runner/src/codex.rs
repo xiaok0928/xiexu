@@ -135,6 +135,14 @@ fn build_prompt(kind: &str, context: &TaskPromptContext<'_>) -> Result<String, S
         "execute_task" => Ok(format!("你是协序的执行 Agent。请在当前工作区完成下面任务，先检查现有内容，再进行必要修改和验证。不得访问当前工作区之外的文件。最后输出完成摘要、验证结果和仍存在的限制。\n\n{task}")),
         "optimize_agent_profile" => Ok(format!("你是协序的 Agent 身份设计助手。请根据用户输入生成职责草案，包含角色定位、核心职责、工作边界、协作方式和结果要求。只输出草案，不修改任何文件或现有 Agent 配置。\n\n{task}")),
         "summarize_conversation" => Ok(format!("你是协序的协作记录整理 Agent。请将对话归纳为目标、关键决定、已完成事项、未完成事项、依赖和后续动作。不要创造对话中不存在的结论。\n\n{task}")),
+        "refresh_project_document" => Ok(format!(
+            concat!(
+                "你是协序的项目协调 Agent。请根据目标章节当前内容、项目其他章节和任务事实，输出目标章节的完整替换候选。",
+                "只输出候选正文，不要添加标题、解释、Markdown 代码块或数据库操作；不得修改工作区文件，",
+                "不得创造输入中不存在的进展或结论。\n\n{task}"
+            ),
+            task = task
+        )),
         _ => Err(format!("unsupported Codex job kind: {kind}")),
     }
 }

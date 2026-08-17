@@ -322,7 +322,92 @@ async fn main() {
              INSERT INTO conversation_participants (conversation_id, actor_type, actor_id)
                SELECT c.id, 'agent', pa.agent_id FROM project_agents pa JOIN conversations c ON c.project_id = pa.project_id AND c.conversation_type = 'project_main'
                WHERE pa.assignment_type = 'coordinator' AND pa.status = 'active' ON CONFLICT DO NOTHING;
-             INSERT INTO schema_migrations (version) VALUES ('0005_m3_agent_collaboration') ON CONFLICT (version) DO NOTHING;",
+             INSERT INTO schema_migrations (version) VALUES ('0005_m3_agent_collaboration') ON CONFLICT (version) DO NOTHING;
+             ALTER TABLE projects ADD COLUMN IF NOT EXISTS document_refresh_requested_at TIMESTAMPTZ;
+             ALTER TABLE tasks ADD COLUMN IF NOT EXISTS collaboration_status TEXT NOT NULL DEFAULT 'ready';
+             ALTER TABLE task_comments ADD COLUMN IF NOT EXISTS parent_comment_id TEXT REFERENCES task_comments(id) ON DELETE SET NULL;
+             ALTER TABLE task_relations ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active';
+             ALTER TABLE task_relations ADD COLUMN IF NOT EXISTS source_comment_id TEXT REFERENCES task_comments(id) ON DELETE SET NULL;
+             ALTER TABLE task_relations ADD COLUMN IF NOT EXISTS resolved_comment_id TEXT REFERENCES task_comments(id) ON DELETE SET NULL;
+             ALTER TABLE task_relations ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ;
+             ALTER TABLE project_documents ADD COLUMN IF NOT EXISTS current_version_no INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE project_documents ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active';
+             ALTER TABLE project_documents ADD COLUMN IF NOT EXISTS last_refreshed_at TIMESTAMPTZ;
+             ALTER TABLE project_document_versions ADD COLUMN IF NOT EXISTS source_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL;
+             ALTER TABLE project_document_versions ADD COLUMN IF NOT EXISTS rollback_from_version_no INTEGER;
+             ALTER TABLE project_document_versions ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb;
+             CREATE TABLE IF NOT EXISTS project_document_sections (
+               document_id TEXT NOT NULL REFERENCES project_documents(id) ON DELETE CASCADE,
+               section_key TEXT NOT NULL,
+               title TEXT NOT NULL,
+               content TEXT NOT NULL DEFAULT '',
+               sort_order INTEGER NOT NULL DEFAULT 0,
+               locked_by_human BOOLEAN NOT NULL DEFAULT FALSE,
+               revision BIGINT NOT NULL DEFAULT 0,
+               created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+               updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+               PRIMARY KEY (document_id, section_key)
+             );
+             CREATE TABLE IF NOT EXISTS project_document_update_candidates (
+               id TEXT PRIMARY KEY,
+               document_id TEXT NOT NULL REFERENCES project_documents(id) ON DELETE CASCADE,
+               section_key TEXT NOT NULL,
+               proposed_content TEXT NOT NULL,
+               source_type TEXT NOT NULL,
+               source_id TEXT,
+               base_section_revision BIGINT NOT NULL,
+               status TEXT NOT NULL DEFAULT 'pending',
+               conflict_reason TEXT,
+               created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+               resolved_at TIMESTAMPTZ
+             );
+             CREATE INDEX IF NOT EXISTS project_document_candidates_idx ON project_document_update_candidates(document_id, status, created_at);
+             CREATE TABLE IF NOT EXISTS task_mentions (
+               id TEXT PRIMARY KEY,
+               comment_id TEXT NOT NULL REFERENCES task_comments(id) ON DELETE CASCADE,
+               source_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+               target_type TEXT NOT NULL,
+               target_id TEXT NOT NULL,
+               status TEXT NOT NULL DEFAULT 'pending',
+               resolved_by_comment_id TEXT REFERENCES task_comments(id) ON DELETE SET NULL,
+               created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+               resolved_at TIMESTAMPTZ
+             );
+             CREATE INDEX IF NOT EXISTS task_mentions_source_idx ON task_mentions(source_task_id, status, created_at);
+             CREATE INDEX IF NOT EXISTS task_mentions_target_idx ON task_mentions(target_type, target_id, status, created_at);
+             INSERT INTO project_document_sections (document_id, section_key, title, content, sort_order)
+               SELECT pd.id, seed.section_key, seed.title,
+                 CASE seed.section_key
+                   WHEN 'goal' THEN CASE WHEN p.description = '' THEN '项目目标待 Human 补充。' ELSE p.description END
+                   WHEN 'scope' THEN '记录当前确认的范围、明确排除项与兼容边界。'
+                   WHEN 'progress' THEN '项目已创建，任务进展将在文档刷新后汇总。'
+                   WHEN 'decisions' THEN '尚无已确认决策。'
+                   ELSE '尚无已识别风险。'
+                 END,
+                 seed.sort_order
+               FROM project_documents pd
+               JOIN projects p ON p.id = pd.project_id
+               CROSS JOIN (VALUES ('goal', '项目目标', 10), ('scope', '范围与边界', 20), ('progress', '交付进展', 30),
+                 ('decisions', '关键决策', 40), ('risks', '风险与待办', 50)) AS seed(section_key, title, sort_order)
+               WHERE pd.doc_type = 'overview'
+             ON CONFLICT (document_id, section_key) DO NOTHING;
+             INSERT INTO project_document_versions (id, document_id, version_no, content, content_hash, source_type, created_by_actor_id, metadata)
+               SELECT 'm4-initial-version-' || pd.id, pd.id, 1,
+                 jsonb_build_object('sections', jsonb_agg(jsonb_build_object('section_key', s.section_key, 'title', s.title, 'content', s.content,
+                   'sort_order', s.sort_order, 'locked_by_human', s.locked_by_human, 'revision', s.revision) ORDER BY s.sort_order, s.section_key))::text,
+                 md5(jsonb_build_object('sections', jsonb_agg(jsonb_build_object('section_key', s.section_key, 'title', s.title, 'content', s.content,
+                   'sort_order', s.sort_order, 'locked_by_human', s.locked_by_human, 'revision', s.revision) ORDER BY s.sort_order, s.section_key))::text),
+                 'initial_generation', 'system', jsonb_build_object('migration', '0006_m4_project_context')
+               FROM project_documents pd
+               JOIN project_document_sections s ON s.document_id = pd.id
+               WHERE NOT EXISTS (SELECT 1 FROM project_document_versions existing WHERE existing.document_id = pd.id)
+               GROUP BY pd.id
+             ON CONFLICT (document_id, version_no) DO NOTHING;
+             UPDATE project_documents pd SET current_version_no = versions.version_no, revision = GREATEST(pd.revision, versions.version_no),
+               last_refreshed_at = COALESCE(pd.last_refreshed_at, now())
+               FROM (SELECT document_id, max(version_no) AS version_no FROM project_document_versions GROUP BY document_id) versions
+               WHERE pd.id = versions.document_id AND pd.current_version_no < versions.version_no;
+             INSERT INTO schema_migrations (version) VALUES ('0006_m4_project_context') ON CONFLICT (version) DO NOTHING;",
         )
         .await
         .expect("apply migration");

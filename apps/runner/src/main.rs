@@ -7,11 +7,14 @@ use tokio::task::JoinHandle;
 use tokio_postgres::{Client, NoTls};
 use uuid::Uuid;
 
+/// 自动刷新项目概览时唯一允许改写的章节，其他章节仍由 Human 或后续专用流程维护。
+const DOCUMENT_REFRESH_SECTION_KEY: &str = "progress";
+
 /// 已领取的执行作业，携带本次尝试的租约身份。
 struct ClaimedJob {
     /// 作业主键。
     job_id: String,
-    /// 作业类型，M2 只允许受控的 execute_task。
+    /// 作业类型，用于选择任务执行、协作整理或项目文档刷新流程。
     kind: String,
     /// 关联任务主键。
     task_id: Option<String>,
@@ -55,7 +58,21 @@ struct ExecutionContext {
     memories: String,
 }
 
-/// 运行器入口：注册实例、续租并循环领取 M2 执行作业。
+/// 项目文档刷新上下文，同时保存提示输入和候选落库所需的文档身份。
+struct DocumentRefreshContext {
+    /// 复用统一 Codex 提示协议的项目、Agent 与变更摘要。
+    execution: ExecutionContext,
+    /// 待刷新的项目文档主键。
+    document_id: String,
+    /// 本次候选固定面向的章节键。
+    section_key: String,
+    /// 生成候选时读取的章节版本，用于完成阶段检测并发修改。
+    base_section_revision: i64,
+    /// 受控模式根据事实源直接生成的章节候选内容。
+    controlled_candidate: String,
+}
+
+/// 运行器入口：注册实例、续租、扫描兜底刷新并循环领取执行作业。
 #[tokio::main]
 async fn main() {
     // 读取运行时配置，保持 Runner 身份和数据库依赖可由 Compose 注入。
@@ -74,6 +91,7 @@ async fn main() {
     // 心跳与领取使用独立节拍，后台执行期间仍持续续租 Runner 和 attempt。
     let mut heartbeat_tick = tokio::time::interval(Duration::from_secs(10));
     let mut claim_tick = tokio::time::interval(Duration::from_secs(2));
+    let mut document_refresh_tick = tokio::time::interval(Duration::from_secs(30));
     let mut active_execution: Option<ActiveExecution> = None;
     loop {
         tokio::select! {
@@ -116,6 +134,11 @@ async fn main() {
                     }
                 }
             }
+            _ = document_refresh_tick.tick() => {
+                if let Err(error) = scan_project_document_refreshes(&database_url).await {
+                    eprintln!("runner project document scan failed: {error}");
+                }
+            }
         }
     }
 }
@@ -152,6 +175,64 @@ async fn scan_todo_tasks(database_url: &str) -> Result<(), String> {
             transaction.execute("INSERT INTO task_events (task_id, event_type, actor_type, actor_id, event_data) VALUES ($1, 'execution.plan_queued', 'system', 'runner', $2)", &[&task_id, &json!({ "kind": "prepare_task_plan", "dedupe_key": dedupe_key })]).await.map_err(|error| error.to_string())?;
         }
     }
+    transaction.commit().await.map_err(|error| error.to_string())
+}
+
+/// 每约三十秒扫描落后于项目任务变更的文档，并按文档 revision 幂等补建刷新作业。
+async fn scan_project_document_refreshes(database_url: &str) -> Result<(), String> {
+    // 扫描使用短事务持有文档行锁，排队完成后立即释放，不阻塞实际刷新执行。
+    let mut client = connect(database_url).await?;
+    let transaction = client.transaction().await.map_err(|error| error.to_string())?;
+
+    // 一次批量锁定所有满足条件的文档；活跃作业和文档锁共同避免多 Runner 重复排队。
+    let rows = transaction
+        .query(
+            concat!(
+                "SELECT pd.id, pd.project_id, pd.revision, coordinator.agent_id, changes.latest_task_watermark FROM project_documents pd ",
+                "JOIN project_agents coordinator ON coordinator.project_id = pd.project_id AND coordinator.assignment_type = 'coordinator' ",
+                "AND coordinator.status = 'active' JOIN LATERAL (SELECT floor(extract(epoch FROM max(t.updated_at)) * 1000000)::bigint ",
+                "AS latest_task_watermark FROM tasks t WHERE t.project_id = pd.project_id HAVING max(t.updated_at) > ",
+                "COALESCE(pd.last_refreshed_at, '-infinity'::timestamptz)) changes ON TRUE WHERE pd.status = 'active' AND NOT EXISTS ",
+                "(SELECT 1 FROM execution_jobs j WHERE j.kind = 'refresh_project_document' AND j.status IN ('queued', 'running') ",
+                "AND j.payload ->> 'document_id' = pd.id) FOR UPDATE OF pd SKIP LOCKED"
+            ),
+            &[],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    for row in rows {
+        let document_id = row.get::<_, String>(0);
+        let project_id = row.get::<_, String>(1);
+        let document_revision = row.get::<_, i64>(2);
+        let agent_id = row.get::<_, String>(3);
+        let latest_task_watermark = row.get::<_, i64>(4);
+        let dedupe_key = format!("document:{document_id}:refresh:scheduled:{latest_task_watermark}:revision:{document_revision}");
+
+        // payload 保存触发事实和扫描水位，执行时仍从数据库重新加载最新章节与任务状态。
+        transaction
+            .execute(
+                concat!(
+                    "INSERT INTO execution_jobs (id, kind, status, project_id, agent_id, payload, dedupe_key) ",
+                    "VALUES ($1, 'refresh_project_document', 'queued', $2, $3, $4, $5) ON CONFLICT (dedupe_key) DO NOTHING"
+                ),
+                &[
+                    &Uuid::new_v4().to_string(),
+                    &project_id,
+                    &agent_id,
+                    &json!({
+                        "document_id": document_id,
+                        "trigger_type": "scheduled",
+                        "document_revision": document_revision,
+                        "latest_task_watermark": latest_task_watermark
+                    }),
+                    &dedupe_key,
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+
+    // 扫描批次统一提交，保证判重结果和所有新作业同时可见。
     transaction.commit().await.map_err(|error| error.to_string())
 }
 
@@ -214,15 +295,20 @@ async fn claim_job(database_url: &str, runner_id: &str, lease_seconds: i32) -> R
     let payload = row.get::<_, serde_json::Value>(6);
     let attempt_id = Uuid::new_v4().to_string();
 
-    // 领取和任务执行态更新处于同一事务，避免出现有尝试但任务仍显示空闲的窗口。
+    // 领取和任务执行态更新处于同一事务；文档刷新即使关联来源任务也不得改变任务主状态。
     transaction.execute("UPDATE execution_jobs SET status = 'running', attempt_count = attempt_count + 1, updated_at = now() WHERE id = $1", &[&job_id]).await.map_err(|error| error.to_string())?;
     // 租约秒数只来自内部受限配置，使用字面量避免 interval 参数的驱动编码限制。
     let attempt_insert = format!(
         "INSERT INTO execution_attempts (id, job_id, runner_instance_id, status, lease_expires_at) VALUES ($1, $2, $3, 'running', now() + interval '{lease_seconds} seconds')",
     );
     transaction.execute(&attempt_insert, &[&attempt_id, &job_id, &runner_id]).await.map_err(|error| error.to_string())?;
-    if let Some(task_id) = task_id.as_ref() {
-        transaction.execute("UPDATE tasks SET execution_status = 'running', updated_at = now() WHERE id = $1 AND board_stage = 'in_progress'", &[task_id]).await.map_err(|error| error.to_string())?;
+    if kind != "refresh_project_document" {
+        if let Some(task_id) = task_id.as_ref() {
+            transaction
+                .execute("UPDATE tasks SET execution_status = 'running', updated_at = now() WHERE id = $1 AND board_stage = 'in_progress'", &[task_id])
+                .await
+                .map_err(|error| error.to_string())?;
+        }
     }
     transaction.execute("INSERT INTO execution_events (job_id, attempt_id, task_id, event_type, payload) VALUES ($1, $2, $3, 'job.claimed', $4)", &[&job_id, &attempt_id, &task_id, &json!({ "runner_id": runner_id })]).await.map_err(|error| error.to_string())?;
     transaction.commit().await.map_err(|error| error.to_string())?;
@@ -232,12 +318,13 @@ async fn claim_job(database_url: &str, runner_id: &str, lease_seconds: i32) -> R
 /// 执行白名单作业，真实模式调用 Codex，受控模式保留可验证的本地输出。
 async fn execute_job(database_url: &str, runner_id: &str, mut job: ClaimedJob, codex_config: &CodexConfig) -> Result<(), String> {
     // 先验证作业类型，避免无效请求启动外部进程。
-    let supported = ["execute_task", "prepare_task_plan", "optimize_agent_profile", "summarize_conversation"];
+    let supported = ["execute_task", "prepare_task_plan", "optimize_agent_profile", "summarize_conversation", "refresh_project_document"];
     if !supported.contains(&job.kind.as_str()) {
         return mark_failed(database_url, &job, "unsupported execution kind").await;
     }
 
     // 按作业范围加载最小业务上下文，职责和记忆始终由服务端事实源生成。
+    let mut document_refresh_context = None;
     let context = match job.kind.as_str() {
         "execute_task" | "prepare_task_plan" => {
             let Some(task_id) = job.task_id.as_ref() else { return mark_failed(database_url, &job, "task execution requires task_id").await; };
@@ -247,6 +334,27 @@ async fn execute_job(database_url: &str, runner_id: &str, mut job: ClaimedJob, c
         "summarize_conversation" => {
             let Some(conversation_id) = job.conversation_id.as_ref() else { return mark_failed(database_url, &job, "conversation summary requires conversation_id").await; };
             load_conversation_context(database_url, conversation_id).await?
+        }
+        "refresh_project_document" => {
+            let refresh_context = match load_project_document_context(database_url, &job).await {
+                Ok(context) => context,
+                Err(error) => {
+                    mark_failed(database_url, &job, &error).await?;
+                    return Err(error);
+                }
+            };
+            let execution = ExecutionContext {
+                project_id: refresh_context.execution.project_id.clone(),
+                project_name: refresh_context.execution.project_name.clone(),
+                title: refresh_context.execution.title.clone(),
+                description: refresh_context.execution.description.clone(),
+                agent_id: refresh_context.execution.agent_id.clone(),
+                agent_name: refresh_context.execution.agent_name.clone(),
+                agent_instructions: refresh_context.execution.agent_instructions.clone(),
+                memories: refresh_context.execution.memories.clone(),
+            };
+            document_refresh_context = Some(refresh_context);
+            execution
         }
         _ => unreachable!("job kind was validated"),
     };
@@ -267,6 +375,7 @@ async fn execute_job(database_url: &str, runner_id: &str, mut job: ClaimedJob, c
             "execute_task" => "受控执行完成，等待 Human 验收。",
             "optimize_agent_profile" => "职责草案：明确目标、核心职责、工作边界、协作对象与结果标准，并以事实和验证结果完成交付。",
             "summarize_conversation" => "对话总结已生成：保留目标、关键决定、任务关联、未完成事项与后续动作。",
+            "refresh_project_document" => document_refresh_context.as_ref().expect("document refresh context exists").controlled_candidate.as_str(),
             _ => unreachable!("job kind was validated"),
         };
         Ok((content.to_owned(), None))
@@ -284,6 +393,10 @@ async fn execute_job(database_url: &str, runner_id: &str, mut job: ClaimedJob, c
         "execute_task" => finish_execution_job(database_url, runner_id, &job, job.task_id.as_deref().expect("validated task id"), &output_content, thread_id.as_deref()).await,
         "optimize_agent_profile" => finish_general_job(database_url, runner_id, &job, "responsibility_draft", &output_content, thread_id.as_deref()).await,
         "summarize_conversation" => finish_conversation_summary(database_url, runner_id, &job, &output_content, thread_id.as_deref()).await,
+        "refresh_project_document" => {
+            let refresh_context = document_refresh_context.as_ref().expect("document refresh context exists");
+            finish_document_refresh_job(database_url, runner_id, &job, refresh_context, &output_content, thread_id.as_deref()).await
+        }
         _ => unreachable!("job kind was validated"),
     }
 }
@@ -333,6 +446,117 @@ async fn load_conversation_context(database_url: &str, conversation_id: &str) ->
     let description = transcript.chars().take(60_000).collect::<String>();
     let memories = load_memories(&client, &agent_id, Some(&project_id), None).await?;
     Ok(ExecutionContext { project_id, project_name: row.get(1), title: row.get(2), description, agent_id: Some(agent_id), agent_name: row.get(4), agent_instructions: row.get(5), memories })
+}
+
+/// 加载项目、目标章节、任务快照与协调 Agent，生成文档刷新所需的完整事实上下文。
+async fn load_project_document_context(database_url: &str, job: &ClaimedJob) -> Result<DocumentRefreshContext, String> {
+    // 文档身份必须来自受控 payload，并且在作业声明项目时必须属于同一项目。
+    let document_id = job.payload.get("document_id").and_then(serde_json::Value::as_str).ok_or_else(|| "document refresh requires document_id".to_owned())?;
+    let client = connect(database_url).await?;
+    let row = client
+        .query_opt(
+            concat!(
+                "SELECT p.id, p.name, pd.title, section.title, section.content, a.id, a.name, concat_ws(E'\n', a.instructions, ",
+                "NULLIF(a.responsibility_supplement, ''), NULLIF(coordinator.responsibility_override, '')), ",
+                "pd.last_refreshed_at, section.revision FROM project_documents pd ",
+                "JOIN projects p ON p.id = pd.project_id JOIN project_document_sections section ON section.document_id = pd.id ",
+                "AND section.section_key = $2 JOIN project_agents coordinator ON coordinator.project_id = p.id ",
+                "AND coordinator.assignment_type = 'coordinator' AND coordinator.status = 'active' JOIN agents a ON a.id = coordinator.agent_id ",
+                "WHERE pd.id = $1 AND pd.status = 'active' AND ($3::text IS NULL OR p.id = $3)"
+            ),
+            &[&document_id, &DOCUMENT_REFRESH_SECTION_KEY, &job.project_id],
+        )
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "active project document, progress section, or coordinator not found".to_owned())?;
+    let project_id = row.get::<_, String>(0);
+    let agent_id = row.get::<_, String>(5);
+    let last_refreshed_at = row.get::<_, Option<std::time::SystemTime>>(8);
+
+    // 当前所有章节作为只读背景提供给协调 Agent，避免进度候选与 Human 已维护内容相互矛盾。
+    let section_rows = client
+        .query(
+            "SELECT section_key, title, content, locked_by_human, revision FROM project_document_sections WHERE document_id = $1 ORDER BY sort_order, section_key",
+            &[&document_id],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let sections = section_rows
+        .iter()
+        .map(|section| {
+            format!(
+                "- [{}] {}（revision {}{}）：{}",
+                section.get::<_, String>(0),
+                section.get::<_, String>(1),
+                section.get::<_, i64>(4),
+                if section.get::<_, bool>(3) { "，Human 锁定" } else { "" },
+                section.get::<_, String>(2)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // 一次查询取得完整任务快照并标记自上次刷新后的变更，生成候选时不做逐任务访问。
+    let source_task_id = job.payload.get("source_task_id").and_then(serde_json::Value::as_str);
+    let task_rows = client
+        .query(
+            concat!(
+                "SELECT id, title, board_stage, plan_status, execution_status, acceptance_status, progress_percent, revision, ",
+                "updated_at > COALESCE($2::timestamptz, '-infinity'::timestamptz) OR id = $3, ",
+                "to_char(updated_at, 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') FROM tasks ",
+                "WHERE project_id = $1 ORDER BY created_at, id LIMIT 200"
+            ),
+            &[&project_id, &last_refreshed_at, &source_task_id],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let task_snapshot = task_rows
+        .iter()
+        .map(|task| {
+            format!(
+                "- {} [{}] {}：进度 {}%，plan={}，execution={}，acceptance={}，revision={}，updated_at={}",
+                if task.get::<_, bool>(8) { "[本次变更]" } else { "[未变更]" },
+                task.get::<_, String>(2),
+                task.get::<_, String>(1),
+                task.get::<_, i16>(6),
+                task.get::<_, String>(3),
+                task.get::<_, String>(4),
+                task.get::<_, String>(5),
+                task.get::<_, i64>(7),
+                task.get::<_, String>(9)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let controlled_candidate = if task_rows.is_empty() { "项目当前尚无任务。".to_owned() } else { format!("项目任务进展：\n{task_snapshot}") };
+
+    // 刷新提示显式区分当前章节、其他章节和任务事实，真实模式只能返回目标章节的完整替换候选。
+    let description = format!(
+        concat!(
+            "目标章节当前内容：\n{}\n\n项目全部章节：\n{}\n\n",
+            "项目任务快照（[本次变更] 表示晚于上次成功刷新或为显式来源任务）：\n{}"
+        ),
+        row.get::<_, String>(4),
+        sections,
+        if task_snapshot.is_empty() { "无任务" } else { &task_snapshot }
+    );
+    let memories = load_memories(&client, &agent_id, Some(&project_id), source_task_id).await?;
+    Ok(DocumentRefreshContext {
+        execution: ExecutionContext {
+            project_id,
+            project_name: row.get(1),
+            title: format!("刷新《{}》的{}章节", row.get::<_, String>(2), row.get::<_, String>(3)),
+            description,
+            agent_id: Some(agent_id),
+            agent_name: row.get(6),
+            agent_instructions: row.get(7),
+            memories,
+        },
+        document_id: document_id.to_owned(),
+        section_key: DOCUMENT_REFRESH_SECTION_KEY.to_owned(),
+        base_section_revision: row.get(9),
+        controlled_candidate,
+    })
 }
 
 /// 批量加载一个 Agent 在给定项目、任务范围内可用的最近记忆。
@@ -404,6 +628,198 @@ async fn finish_conversation_summary(database_url: &str, runner_id: &str, job: &
     transaction.commit().await.map_err(|error| error.to_string())
 }
 
+/// 完成文档刷新：锁定章节只留待审候选，存在待审候选时记冲突，否则应用候选并创建完整版本。
+async fn finish_document_refresh_job(
+    database_url: &str,
+    runner_id: &str,
+    job: &ClaimedJob,
+    context: &DocumentRefreshContext,
+    output_content: &str,
+    thread_id: Option<&str>,
+) -> Result<(), String> {
+    // 空候选不能覆盖现有章节，按普通执行失败进入既有重试机制且不触碰任务状态。
+    let proposed_content = output_content.trim();
+    if proposed_content.is_empty() {
+        return mark_failed(database_url, job, "document refresh produced empty candidate").await;
+    }
+
+    // 同时锁定文档和目标章节，候选判重、章节更新及版本号递增在一个事务内串行化。
+    let mut client = connect(database_url).await?;
+    let transaction = client.transaction().await.map_err(|error| error.to_string())?;
+    let row = transaction
+        .query_opt(
+            concat!(
+                "SELECT pd.current_version_no, section.locked_by_human, section.revision FROM project_documents pd ",
+                "JOIN project_document_sections section ON section.document_id = pd.id AND section.section_key = $2 ",
+                "WHERE pd.id = $1 AND pd.status = 'active' AND pd.project_id = $3 FOR UPDATE OF pd, section"
+            ),
+            &[&context.document_id, &context.section_key, &context.execution.project_id],
+        )
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "active project document section not found".to_owned())?;
+    let current_version_no = row.get::<_, i32>(0);
+    let locked_by_human = row.get::<_, bool>(1);
+    let current_section_revision = row.get::<_, i64>(2);
+    let pending_exists = transaction
+        .query_opt(
+            "SELECT 1 FROM project_document_update_candidates WHERE document_id = $1 AND section_key = $2 AND status = 'pending' LIMIT 1",
+            &[&context.document_id, &context.section_key],
+        )
+        .await
+        .map_err(|error| error.to_string())?
+        .is_some();
+    let candidate_id = Uuid::new_v4().to_string();
+    let trigger_type = job
+        .payload
+        .get("trigger_type")
+        .or_else(|| job.payload.get("trigger"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unspecified");
+    let source_task_id = job.payload.get("source_task_id").and_then(serde_json::Value::as_str);
+    let source_conversation_id = job.payload.get("source_conversation_id").and_then(serde_json::Value::as_str);
+    let source_id = source_task_id.or(source_conversation_id);
+
+    // 已有待审候选或生成期间发生章节修改时保留冲突候选，避免多个来源静默覆盖。
+    let candidate_status = if pending_exists {
+        transaction
+            .execute(
+                concat!(
+                    "INSERT INTO project_document_update_candidates ",
+                    "(id, document_id, section_key, proposed_content, source_type, source_id, base_section_revision, status, conflict_reason) ",
+                    "VALUES ($1, $2, $3, $4, $5, $6, $7, 'conflict', 'pending candidate already exists')"
+                ),
+                &[&candidate_id, &context.document_id, &context.section_key, &proposed_content, &trigger_type, &source_id, &context.base_section_revision],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        "conflict"
+    } else if current_section_revision != context.base_section_revision {
+        transaction
+            .execute(
+                concat!(
+                    "INSERT INTO project_document_update_candidates ",
+                    "(id, document_id, section_key, proposed_content, source_type, source_id, base_section_revision, status, conflict_reason) ",
+                    "VALUES ($1, $2, $3, $4, $5, $6, $7, 'conflict', 'section changed while refresh was running')"
+                ),
+                &[&candidate_id, &context.document_id, &context.section_key, &proposed_content, &trigger_type, &source_id, &context.base_section_revision],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        "conflict"
+    } else if locked_by_human {
+        // Human 锁定章节只生成 pending 候选，文档内容、版本号和刷新水位保持不变。
+        transaction
+            .execute(
+                concat!(
+                    "INSERT INTO project_document_update_candidates ",
+                    "(id, document_id, section_key, proposed_content, source_type, source_id, base_section_revision, status) ",
+                    "VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')"
+                ),
+                &[&candidate_id, &context.document_id, &context.section_key, &proposed_content, &trigger_type, &source_id, &context.base_section_revision],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        "pending"
+    } else {
+        // 未锁定且无待审候选时立即应用，并把候选保留为可审计的 applied 记录。
+        transaction
+            .execute(
+                concat!(
+                    "INSERT INTO project_document_update_candidates ",
+                    "(id, document_id, section_key, proposed_content, source_type, source_id, base_section_revision, status, resolved_at) ",
+                    "VALUES ($1, $2, $3, $4, $5, $6, $7, 'applied', now())"
+                ),
+                &[&candidate_id, &context.document_id, &context.section_key, &proposed_content, &trigger_type, &source_id, &context.base_section_revision],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "UPDATE project_document_sections SET content = $3, revision = revision + 1, updated_at = now() WHERE document_id = $1 AND section_key = $2",
+                &[&context.document_id, &context.section_key, &proposed_content],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+
+        // 新版本保存更新后所有章节的完整快照，回滚和历史查看不依赖当前章节表。
+        let version_content = transaction
+            .query_one(
+                concat!(
+                    "SELECT jsonb_build_object('sections', jsonb_agg(jsonb_build_object('section_key', section_key, 'title', title, ",
+                    "'content', content, 'sort_order', sort_order, 'locked_by_human', locked_by_human, 'revision', revision) ",
+                    "ORDER BY sort_order, section_key))::text FROM project_document_sections WHERE document_id = $1"
+                ),
+                &[&context.document_id],
+            )
+            .await
+            .map_err(|error| error.to_string())?
+            .get::<_, String>(0);
+        let next_version_no = current_version_no + 1;
+        transaction
+            .execute(
+                concat!(
+                    "INSERT INTO project_document_versions ",
+                    "(id, document_id, version_no, content, content_hash, source_type, source_task_id, created_by_actor_id, metadata) ",
+                    "VALUES ($1, $2, $3, $4, md5($4), 'agent_refresh', $5, $6, $7)"
+                ),
+                &[
+                    &Uuid::new_v4().to_string(),
+                    &context.document_id,
+                    &next_version_no,
+                    &version_content,
+                    &source_task_id,
+                    &runner_id,
+                    &json!({
+                        "job_id": job.job_id.clone(),
+                        "attempt_id": job.attempt_id.clone(),
+                        "candidate_id": candidate_id.clone(),
+                        "section_key": context.section_key.clone(),
+                        "trigger_type": trigger_type,
+                        "source_conversation_id": source_conversation_id
+                    }),
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "UPDATE project_documents SET current_version_no = $2, revision = revision + 1, last_refreshed_at = now(), updated_at = now() WHERE id = $1",
+                &[&context.document_id, &next_version_no],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        "applied"
+    };
+
+    // 候选结果和 Codex 原始输出进入统一运行记录，调用方可从事件直接识别 applied、pending 或 conflict。
+    transaction
+        .execute(
+            concat!(
+                "INSERT INTO execution_events (job_id, attempt_id, task_id, project_id, agent_id, conversation_id, event_type, payload) ",
+                "VALUES ($1, $2, $3, $4, $5, $6, 'document.refresh_completed', $7)"
+            ),
+            &[
+                &job.job_id,
+                &job.attempt_id,
+                &job.task_id,
+                &job.project_id,
+                &job.agent_id,
+                &job.conversation_id,
+                &json!({
+                    "document_id": context.document_id.clone(),
+                    "section_key": context.section_key.clone(),
+                    "candidate_id": candidate_id,
+                    "candidate_status": candidate_status
+                }),
+            ],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    finish_general_records(&transaction, runner_id, job, "document_update_candidate", proposed_content, thread_id).await?;
+    transaction.commit().await.map_err(|error| error.to_string())
+}
+
 /// 在调用方事务内保存通用作业输出、尝试状态和审计事件。
 async fn finish_general_records(transaction: &tokio_postgres::Transaction<'_>, runner_id: &str, job: &ClaimedJob, output_type: &str, output_content: &str, thread_id: Option<&str>) -> Result<(), String> {
     // 输出携带全部可用业务作用域，后续页面无需解析 payload 才能定位来源。
@@ -436,10 +852,18 @@ async fn mark_failed(database_url: &str, job: &ClaimedJob, message: &str) -> Res
     // 第一次和第二次失败分别延迟 1 分钟、5 分钟，达到三次总尝试后停止自动重试。
     let job_row = transaction.query_one("UPDATE execution_jobs SET status = CASE WHEN attempt_count >= max_attempts THEN 'failed' ELSE 'queued' END, available_at = CASE WHEN attempt_count >= max_attempts THEN available_at WHEN attempt_count = 1 THEN now() + interval '1 minute' ELSE now() + interval '5 minutes' END, updated_at = now() WHERE id = $1 RETURNING status", &[&job.job_id]).await.map_err(|error| error.to_string())?;
     let job_status = job_row.get::<_, String>(0);
-    if let Some(task_id) = job.task_id.as_ref() {
-        // 达到重试上限才让任务显示失败，仍可重试的作业保持 queued 语义。
-        let task_status = if job_status == "failed" { "failed" } else { "queued" };
-        transaction.execute("UPDATE tasks SET execution_status = $2, updated_at = now() WHERE id = $1 AND board_stage IN ('todo', 'in_progress')", &[task_id, &task_status]).await.map_err(|error| error.to_string())?;
+    if job.kind != "refresh_project_document" {
+        if let Some(task_id) = job.task_id.as_ref() {
+            // 达到重试上限才让任务显示失败，仍可重试的作业保持 queued 语义。
+            let task_status = if job_status == "failed" { "failed" } else { "queued" };
+            transaction
+                .execute(
+                    "UPDATE tasks SET execution_status = $2, updated_at = now() WHERE id = $1 AND board_stage IN ('todo', 'in_progress')",
+                    &[task_id, &task_status],
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+        }
     }
 
     // 对话总结达到重试上限后恢复可编辑状态，避免永久停留在 archiving。
