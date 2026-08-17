@@ -35,6 +35,12 @@ pub struct TaskPromptContext<'a> {
     pub title: &'a str,
     /// 任务说明。
     pub description: &'a str,
+    /// 当前执行 Agent 的显示名称；系统作业使用稳定的系统角色名称。
+    pub agent_name: &'a str,
+    /// 合并模板职责、实例指令和项目职责补充后的执行约束。
+    pub agent_instructions: &'a str,
+    /// 仅包含当前 Agent 且符合项目、任务范围的相关记忆。
+    pub memories: &'a str,
 }
 
 /// Codex 成功结果，仅保留最终消息和可选 thread ID。
@@ -75,7 +81,7 @@ impl CodexConfig {
     pub async fn run(&self, kind: &str, context: TaskPromptContext<'_>) -> Result<CodexRunOutput, String> {
         let workspace = self.prepare_workspace(context.project_id).await?;
         let prompt = build_prompt(kind, &context)?;
-        let sandbox = if kind == "prepare_task_plan" { "read-only" } else { "workspace-write" };
+        let sandbox = if kind == "execute_task" { "workspace-write" } else { "read-only" };
 
         // 以非交互模式启动 Codex，排除敏感环境进入模型生成的 Shell 子进程。
         let mut command = Command::new(&self.executable);
@@ -119,10 +125,16 @@ impl CodexConfig {
 
 /// 按白名单作业类型生成稳定提示，用户输入只作为任务内容而不是 CLI 参数。
 fn build_prompt(kind: &str, context: &TaskPromptContext<'_>) -> Result<String, String> {
-    let task = format!("项目：{}\n任务标题：{}\n任务说明：{}", context.project_name, context.title, context.description);
+    // 身份、职责和记忆作为清晰分区进入提示，避免与用户任务内容互相覆盖。
+    let task = format!(
+        "项目：{}\n工作标题：{}\n工作说明：{}\n\n当前 Agent：{}\n职责约束：{}\n\n相关记忆：{}",
+        context.project_name, context.title, context.description, context.agent_name, context.agent_instructions, context.memories
+    );
     match kind {
         "prepare_task_plan" => Ok(format!("你是协序的项目协调 Agent。请只分析当前任务并输出可供 Human 审核的实施方案，不要修改工作区文件。方案应包含目标、步骤、边界、风险和验收方式。\n\n{task}")),
         "execute_task" => Ok(format!("你是协序的执行 Agent。请在当前工作区完成下面任务，先检查现有内容，再进行必要修改和验证。不得访问当前工作区之外的文件。最后输出完成摘要、验证结果和仍存在的限制。\n\n{task}")),
+        "optimize_agent_profile" => Ok(format!("你是协序的 Agent 身份设计助手。请根据用户输入生成职责草案，包含角色定位、核心职责、工作边界、协作方式和结果要求。只输出草案，不修改任何文件或现有 Agent 配置。\n\n{task}")),
+        "summarize_conversation" => Ok(format!("你是协序的协作记录整理 Agent。请将对话归纳为目标、关键决定、已完成事项、未完成事项、依赖和后续动作。不要创造对话中不存在的结论。\n\n{task}")),
         _ => Err(format!("unsupported Codex job kind: {kind}")),
     }
 }

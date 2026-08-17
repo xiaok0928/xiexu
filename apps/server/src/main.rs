@@ -1,3 +1,5 @@
+mod collaboration;
+
 use axum::{extract::{Path, Query, State}, http::StatusCode, response::IntoResponse, routing::{get, post}, Json, Router};
 use serde_json::{json, Value};
 use std::{collections::HashMap, env, sync::Arc, time::Duration};
@@ -8,9 +10,9 @@ use uuid::Uuid;
 
 /// 服务端共享配置，统一承载数据库地址和 Codex 运行状态探测边界。
 #[derive(Clone)]
-struct AppState {
+pub(crate) struct AppState {
     /// PostgreSQL 连接地址，只在服务端内部使用。
-    database_url: Arc<String>,
+    pub(crate) database_url: Arc<String>,
     /// Codex CLI 可执行文件路径。
     codex_bin: Arc<String>,
     /// Runner 使用的 Codex 执行模式。
@@ -60,6 +62,7 @@ async fn main() {
         .route("/api/tasks/:task_id/comments", get(list_comments).post(create_comment))
         .route("/api/tasks/:task_id/events", get(list_events))
         .route("/api/tasks/:task_id/execution", get(list_execution))
+        .merge(collaboration::routes())
         .nest_service("/", ServeDir::new("/app/web").append_index_html_on_directories(true).fallback(ServeFile::new("/app/web/index.html")))
         .with_state(state);
     // 绑定监听端口并启动 HTTP 服务，启动失败直接让容器退出以便编排发现。
@@ -103,17 +106,17 @@ async fn codex_runtime(State(state): State<AppState>) -> Json<CodexRuntimeRespon
 }
 
 /// 统一 API 错误，避免把数据库内部错误直接泄漏给前端。
-struct ApiError(StatusCode, String);
+pub(crate) struct ApiError(StatusCode, String);
 
 impl ApiError {
     /// 构造数据库故障响应。
-    fn database(error: tokio_postgres::Error) -> Self { eprintln!("database error: {error}"); Self(StatusCode::INTERNAL_SERVER_ERROR, "database error".to_owned()) }
+    pub(crate) fn database(error: tokio_postgres::Error) -> Self { eprintln!("database error: {error}"); Self(StatusCode::INTERNAL_SERVER_ERROR, "database error".to_owned()) }
     /// 构造资源不存在响应。
-    fn not_found(message: impl Into<String>) -> Self { Self(StatusCode::NOT_FOUND, message.into()) }
+    pub(crate) fn not_found(message: impl Into<String>) -> Self { Self(StatusCode::NOT_FOUND, message.into()) }
     /// 构造请求校验失败响应。
-    fn invalid(message: impl Into<String>) -> Self { Self(StatusCode::UNPROCESSABLE_ENTITY, message.into()) }
+    pub(crate) fn invalid(message: impl Into<String>) -> Self { Self(StatusCode::UNPROCESSABLE_ENTITY, message.into()) }
     /// 构造状态冲突响应。
-    fn conflict(message: impl Into<String>) -> Self { Self(StatusCode::CONFLICT, message.into()) }
+    pub(crate) fn conflict(message: impl Into<String>) -> Self { Self(StatusCode::CONFLICT, message.into()) }
 }
 
 impl IntoResponse for ApiError {
@@ -122,14 +125,14 @@ impl IntoResponse for ApiError {
 }
 
 /// 建立一个短生命周期数据库连接，事务边界在处理函数内显式可见。
-async fn connect(state: &AppState) -> Result<Client, ApiError> {
+pub(crate) async fn connect(state: &AppState) -> Result<Client, ApiError> {
     let (client, connection) = tokio_postgres::connect(state.database_url.as_str(), NoTls).await.map_err(ApiError::database)?;
     tokio::spawn(async move { if let Err(error) = connection.await { eprintln!("database connection ended: {error}"); } });
     Ok(client)
 }
 
 /// 读取 JSON 字段并执行非空校验。
-fn required_text(body: &Value, key: &str) -> Result<String, ApiError> {
+pub(crate) fn required_text(body: &Value, key: &str) -> Result<String, ApiError> {
     body.get(key).and_then(Value::as_str).map(str::trim).filter(|value| !value.is_empty()).map(ToOwned::to_owned).ok_or_else(|| ApiError::invalid(format!("{key} is required")))
 }
 
@@ -148,16 +151,33 @@ async fn list_projects(State(state): State<AppState>) -> Result<Json<Value>, Api
     Ok(Json(json!({ "items": rows.iter().map(project_json).collect::<Vec<_>>(), "next_cursor": null })))
 }
 
-/// 创建项目，并初始化一个空的项目文档占位。
+/// 创建项目，并在同一事务初始化项目文档、协调 Agent 和长期主群聊。
 async fn create_project(State(state): State<AppState>, Json(body): Json<Value>) -> Result<(StatusCode, Json<Value>), ApiError> {
+    // 校验用户输入并准备共享主键，所有初始化事实必须同时成功或同时回滚。
     let name = required_text(&body, "name")?;
     if name.len() > 200 { return Err(ApiError::invalid("name is too long")); }
     let description = body.get("description").and_then(Value::as_str).unwrap_or("");
     let id = Uuid::new_v4().to_string();
+    let coordinator_id = Uuid::new_v4().to_string();
+    let conversation_id = Uuid::new_v4().to_string();
     let mut client = connect(&state).await?;
     let transaction = client.transaction().await.map_err(ApiError::database)?;
+
+    // 建立项目和项目概览事实，新建项目不会依赖异步任务才能进入可用状态。
     let row = transaction.query_one("INSERT INTO projects (id, name, description) VALUES ($1, $2, $3) RETURNING id, name, description, status, to_char(created_at, 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), to_char(updated_at, 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')", &[&id, &name, &description]).await.map_err(ApiError::database)?;
     transaction.execute("INSERT INTO project_documents (id, project_id, doc_type, title) VALUES ($1, $2, 'overview', '项目概览')", &[&Uuid::new_v4().to_string(), &id]).await.map_err(ApiError::database)?;
+
+    // 为项目创建独立协调 Agent，使其职责补充和私有记忆不会与其他项目混用。
+    let coordinator_name = format!("{name} 协调 Agent");
+    transaction.execute("INSERT INTO agents (id, template_code, name, description, instructions, created_by) VALUES ($1, 'project_manager', $2, '负责该项目的任务拆分、指派、依赖协调和结果汇总。', '以项目目标为边界协调固定与动态 Agent；Human 负责确认关键方案和验收最终结果。', 'system')", &[&coordinator_id, &coordinator_name]).await.map_err(ApiError::database)?;
+    transaction.execute("INSERT INTO project_agents (project_id, agent_id, assignment_type) VALUES ($1, $2, 'coordinator')", &[&id, &coordinator_id]).await.map_err(ApiError::database)?;
+
+    // 创建长期项目主群聊并加入 Human 与协调 Agent，后续固定 Agent 加入项目时会同步加入该群聊。
+    let conversation_title = format!("{name} 项目群");
+    transaction.execute("INSERT INTO conversations (id, conversation_type, project_id, title, created_by) VALUES ($1, 'project_main', $2, $3, 'system')", &[&conversation_id, &id, &conversation_title]).await.map_err(ApiError::database)?;
+    transaction.execute("INSERT INTO conversation_participants (conversation_id, actor_type, actor_id) VALUES ($1, 'human', 'human'), ($1, 'agent', $2)", &[&conversation_id, &coordinator_id]).await.map_err(ApiError::database)?;
+
+    // 提交完整初始化事务后再向调用方暴露项目。
     transaction.commit().await.map_err(ApiError::database)?;
     Ok((StatusCode::CREATED, Json(project_json(&row))))
 }

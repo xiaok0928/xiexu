@@ -15,6 +15,14 @@ struct ClaimedJob {
     kind: String,
     /// 关联任务主键。
     task_id: Option<String>,
+    /// 作业所属项目；非项目级职责优化作业可以为空。
+    project_id: Option<String>,
+    /// 作业指定的 Agent；任务作业缺失时由任务主责或项目协调者补齐。
+    agent_id: Option<String>,
+    /// 对话总结作业关联的对话主键。
+    conversation_id: Option<String>,
+    /// 创建作业时保存的结构化输入。
+    payload: serde_json::Value,
     /// 本次领取生成的尝试主键。
     attempt_id: String,
 }
@@ -27,8 +35,8 @@ struct ActiveExecution {
     handle: JoinHandle<()>,
 }
 
-/// 从数据库读取的最小任务上下文，用于构造 Codex 提示和工作区。
-struct TaskContext {
+/// 从数据库读取的统一执行上下文，用于任务、职责草案和对话总结作业。
+struct ExecutionContext {
     /// 项目主键。
     project_id: String,
     /// 项目名称。
@@ -37,6 +45,14 @@ struct TaskContext {
     title: String,
     /// 任务说明。
     description: String,
+    /// 当前执行 Agent 主键；系统职责草案可以为空。
+    agent_id: Option<String>,
+    /// 当前执行 Agent 名称。
+    agent_name: String,
+    /// 合并实例、项目补充后的职责约束。
+    agent_instructions: String,
+    /// 已按 Agent 和业务范围过滤的记忆文本。
+    memories: String,
 }
 
 /// 运行器入口：注册实例、续租并循环领取 M2 执行作业。
@@ -49,6 +65,11 @@ async fn main() {
     let codex_config = Arc::new(CodexConfig::from_env().expect("load Codex runtime configuration"));
     let lease_seconds = codex_config.lease_seconds();
     println!("xiexu runner {runner_id} starting with Codex mode {}", codex_config.mode_name());
+
+    // 同一 Runner ID 重启时，旧进程已不存在，主动回收其未完成尝试以避免长租约悬挂。
+    if let Err(error) = recover_runner_jobs(&database_url, &runner_id).await {
+        eprintln!("runner startup recovery failed: {error}");
+    }
 
     // 心跳与领取使用独立节拍，后台执行期间仍持续续租 Runner 和 attempt。
     let mut heartbeat_tick = tokio::time::interval(Duration::from_secs(10));
@@ -99,16 +120,33 @@ async fn main() {
     }
 }
 
+/// 回收同一 Runner 身份在进程重启前遗留的运行中作业。
+async fn recover_runner_jobs(database_url: &str, runner_id: &str) -> Result<(), String> {
+    // 尝试和作业状态在一个事务更新，后续领取会生成新的 attempt。
+    let mut client = connect(database_url).await?;
+    let transaction = client.transaction().await.map_err(|error| error.to_string())?;
+    transaction.execute("UPDATE execution_jobs SET status = 'queued', available_at = now(), updated_at = now() WHERE status = 'running' AND attempt_count < max_attempts AND EXISTS (SELECT 1 FROM execution_attempts a WHERE a.job_id = execution_jobs.id AND a.runner_instance_id = $1 AND a.status = 'running')", &[&runner_id]).await.map_err(|error| error.to_string())?;
+    transaction.execute("UPDATE execution_attempts SET status = 'expired', finished_at = now(), failure_message = 'runner restarted' WHERE runner_instance_id = $1 AND status = 'running'", &[&runner_id]).await.map_err(|error| error.to_string())?;
+    transaction.commit().await.map_err(|error| error.to_string())
+}
+
 /// 周期扫描 Todo，按任务 revision 幂等创建方案生成作业。
 async fn scan_todo_tasks(database_url: &str) -> Result<(), String> {
     let mut client = connect(database_url).await?;
     let transaction = client.transaction().await.map_err(|error| error.to_string())?;
-    let rows = transaction.query("SELECT t.id, t.revision FROM tasks t WHERE t.board_stage = 'todo' AND t.requires_plan_confirmation = TRUE AND NOT EXISTS (SELECT 1 FROM execution_jobs j WHERE j.task_id = t.id AND j.kind = 'prepare_task_plan' AND j.status IN ('queued', 'running')) FOR UPDATE SKIP LOCKED", &[]).await.map_err(|error| error.to_string())?;
+
+    // 没有主责的 Todo 任务由项目协调 Agent 保底认领，固定成员与动态参与关系保持分离。
+    transaction.execute("INSERT INTO task_agents (task_id, agent_id, participation_type, status) SELECT t.id, pa.agent_id, 'owner', 'active' FROM tasks t JOIN project_agents pa ON pa.project_id = t.project_id AND pa.assignment_type = 'coordinator' AND pa.status = 'active' WHERE t.board_stage = 'todo' AND NOT EXISTS (SELECT 1 FROM task_agents ta WHERE ta.task_id = t.id AND ta.participation_type = 'owner' AND ta.status = 'active') ON CONFLICT (task_id, agent_id) DO UPDATE SET participation_type = 'owner', status = 'active', joined_at = now(), left_at = NULL", &[]).await.map_err(|error| error.to_string())?;
+
+    // 扫描时同时取得项目和主责 Agent，使后续作业拥有稳定的协作归属。
+    let rows = transaction.query("SELECT t.id, t.revision, t.project_id, ta.agent_id FROM tasks t JOIN task_agents ta ON ta.task_id = t.id AND ta.participation_type = 'owner' AND ta.status = 'active' WHERE t.board_stage = 'todo' AND t.requires_plan_confirmation = TRUE AND NOT EXISTS (SELECT 1 FROM execution_jobs j WHERE j.task_id = t.id AND j.kind = 'prepare_task_plan' AND j.status IN ('queued', 'running')) FOR UPDATE OF t SKIP LOCKED", &[]).await.map_err(|error| error.to_string())?;
     for row in rows {
         let task_id = row.get::<_, String>(0);
         let revision = row.get::<_, i64>(1);
+        let project_id = row.get::<_, String>(2);
+        let agent_id = row.get::<_, String>(3);
         let dedupe_key = format!("task:{task_id}:plan:{revision}");
-        let inserted = transaction.execute("INSERT INTO execution_jobs (id, kind, status, task_id, payload, dedupe_key) VALUES ($1, 'prepare_task_plan', 'queued', $2, $3, $4) ON CONFLICT (dedupe_key) DO NOTHING", &[&Uuid::new_v4().to_string(), &task_id, &json!({ "task_id": task_id.clone(), "revision": revision }), &dedupe_key]).await.map_err(|error| error.to_string())?;
+        let inserted = transaction.execute("INSERT INTO execution_jobs (id, kind, status, task_id, project_id, agent_id, payload, dedupe_key) VALUES ($1, 'prepare_task_plan', 'queued', $2, $3, $4, $5, $6) ON CONFLICT (dedupe_key) DO NOTHING", &[&Uuid::new_v4().to_string(), &task_id, &project_id, &agent_id, &json!({ "task_id": task_id.clone(), "revision": revision }), &dedupe_key]).await.map_err(|error| error.to_string())?;
         if inserted == 1 {
             transaction.execute("UPDATE tasks SET execution_status = 'queued', updated_at = now() WHERE id = $1 AND board_stage = 'todo'", &[&task_id]).await.map_err(|error| error.to_string())?;
             transaction.execute("INSERT INTO task_events (task_id, event_type, actor_type, actor_id, event_data) VALUES ($1, 'execution.plan_queued', 'system', 'runner', $2)", &[&task_id, &json!({ "kind": "prepare_task_plan", "dedupe_key": dedupe_key })]).await.map_err(|error| error.to_string())?;
@@ -162,7 +200,7 @@ async fn claim_job(database_url: &str, runner_id: &str, lease_seconds: i32) -> R
     // 先回收已经失去租约的作业，允许其在最大尝试次数内重新排队。
     transaction.execute("UPDATE execution_jobs SET status = 'queued', available_at = now(), updated_at = now() WHERE status = 'running' AND attempt_count < max_attempts AND EXISTS (SELECT 1 FROM execution_attempts a WHERE a.job_id = execution_jobs.id AND a.status = 'running' AND a.lease_expires_at < now())", &[]).await.map_err(|error| error.to_string())?;
     transaction.execute("UPDATE execution_attempts SET status = 'expired', finished_at = now(), failure_message = 'lease expired' WHERE status = 'running' AND lease_expires_at < now()", &[]).await.map_err(|error| error.to_string())?;
-    let row = transaction.query_opt("SELECT id, kind, task_id FROM execution_jobs WHERE status = 'queued' AND available_at <= now() AND attempt_count < max_attempts ORDER BY created_at ASC FOR UPDATE SKIP LOCKED LIMIT 1", &[]).await.map_err(|error| error.to_string())?;
+    let row = transaction.query_opt("SELECT id, kind, task_id, project_id, agent_id, conversation_id, payload FROM execution_jobs WHERE status = 'queued' AND available_at <= now() AND attempt_count < max_attempts ORDER BY created_at ASC FOR UPDATE SKIP LOCKED LIMIT 1", &[]).await.map_err(|error| error.to_string())?;
     let Some(row) = row else {
         transaction.commit().await.map_err(|error| error.to_string())?;
         return Ok(None);
@@ -170,6 +208,10 @@ async fn claim_job(database_url: &str, runner_id: &str, lease_seconds: i32) -> R
     let job_id = row.get::<_, String>(0);
     let kind = row.get::<_, String>(1);
     let task_id = row.get::<_, Option<String>>(2);
+    let project_id = row.get::<_, Option<String>>(3);
+    let agent_id = row.get::<_, Option<String>>(4);
+    let conversation_id = row.get::<_, Option<String>>(5);
+    let payload = row.get::<_, serde_json::Value>(6);
     let attempt_id = Uuid::new_v4().to_string();
 
     // 领取和任务执行态更新处于同一事务，避免出现有尝试但任务仍显示空闲的窗口。
@@ -184,26 +226,49 @@ async fn claim_job(database_url: &str, runner_id: &str, lease_seconds: i32) -> R
     }
     transaction.execute("INSERT INTO execution_events (job_id, attempt_id, task_id, event_type, payload) VALUES ($1, $2, $3, 'job.claimed', $4)", &[&job_id, &attempt_id, &task_id, &json!({ "runner_id": runner_id })]).await.map_err(|error| error.to_string())?;
     transaction.commit().await.map_err(|error| error.to_string())?;
-    Ok(Some(ClaimedJob { job_id, kind, task_id, attempt_id }))
+    Ok(Some(ClaimedJob { job_id, kind, task_id, project_id, agent_id, conversation_id, payload, attempt_id }))
 }
 
 /// 执行白名单作业，真实模式调用 Codex，受控模式保留可验证的本地输出。
-async fn execute_job(database_url: &str, runner_id: &str, job: ClaimedJob, codex_config: &CodexConfig) -> Result<(), String> {
-    // 先验证作业类型和任务关联，避免无效请求启动外部进程。
-    if job.kind != "execute_task" && job.kind != "prepare_task_plan" {
+async fn execute_job(database_url: &str, runner_id: &str, mut job: ClaimedJob, codex_config: &CodexConfig) -> Result<(), String> {
+    // 先验证作业类型，避免无效请求启动外部进程。
+    let supported = ["execute_task", "prepare_task_plan", "optimize_agent_profile", "summarize_conversation"];
+    if !supported.contains(&job.kind.as_str()) {
         return mark_failed(database_url, &job, "unsupported execution kind").await;
     }
-    let Some(task_id) = job.task_id.as_ref() else {
-        return mark_failed(database_url, &job, "task execution requires task_id").await;
+
+    // 按作业范围加载最小业务上下文，职责和记忆始终由服务端事实源生成。
+    let context = match job.kind.as_str() {
+        "execute_task" | "prepare_task_plan" => {
+            let Some(task_id) = job.task_id.as_ref() else { return mark_failed(database_url, &job, "task execution requires task_id").await; };
+            load_task_context(database_url, task_id).await?
+        }
+        "optimize_agent_profile" => load_agent_profile_context(database_url, &job).await?,
+        "summarize_conversation" => {
+            let Some(conversation_id) = job.conversation_id.as_ref() else { return mark_failed(database_url, &job, "conversation summary requires conversation_id").await; };
+            load_conversation_context(database_url, conversation_id).await?
+        }
+        _ => unreachable!("job kind was validated"),
     };
-    let task = load_task_context(database_url, task_id).await?;
+
+    // 兼容 M2 已入队或旧接口创建的任务作业，在执行前补齐项目和 Agent 作用域。
+    if job.project_id.is_none() && job.kind != "optimize_agent_profile" { job.project_id = Some(context.project_id.clone()); }
+    if job.agent_id.is_none() { job.agent_id = context.agent_id.clone(); }
+    let scope_client = connect(database_url).await?;
+    scope_client.execute("UPDATE execution_jobs SET project_id = COALESCE(project_id, $2), agent_id = COALESCE(agent_id, $3), updated_at = now() WHERE id = $1", &[&job.job_id, &job.project_id, &job.agent_id]).await.map_err(|error| error.to_string())?;
     mark_attempt_started(database_url, runner_id, &job, codex_config.mode_name()).await?;
 
-    // 真实模式只把任务业务字段传给 Codex，数据库配置和其他环境不会进入提示。
+    // 真实模式只把必要业务字段传给 Codex，数据库配置和其他环境不会进入提示。
     let execution_result = if codex_config.is_real() {
-        codex_config.run(&job.kind, TaskPromptContext { project_id: &task.project_id, project_name: &task.project_name, title: &task.title, description: &task.description }).await.map(|output| (output.content, output.thread_id))
+        codex_config.run(&job.kind, TaskPromptContext { project_id: &context.project_id, project_name: &context.project_name, title: &context.title, description: &context.description, agent_name: &context.agent_name, agent_instructions: &context.agent_instructions, memories: &context.memories }).await.map(|output| (output.content, output.thread_id))
     } else {
-        let content = if job.kind == "prepare_task_plan" { "方案草案已生成，等待 Human 确认。" } else { "受控执行完成，等待 Human 验收。" };
+        let content = match job.kind.as_str() {
+            "prepare_task_plan" => "方案草案已生成，等待 Human 确认。",
+            "execute_task" => "受控执行完成，等待 Human 验收。",
+            "optimize_agent_profile" => "职责草案：明确目标、核心职责、工作边界、协作对象与结果标准，并以事实和验证结果完成交付。",
+            "summarize_conversation" => "对话总结已生成：保留目标、关键决定、任务关联、未完成事项与后续动作。",
+            _ => unreachable!("job kind was validated"),
+        };
         Ok((content.to_owned(), None))
     };
     let (output_content, thread_id) = match execution_result {
@@ -213,18 +278,69 @@ async fn execute_job(database_url: &str, runner_id: &str, job: ClaimedJob, codex
             return Err(error);
         }
     };
-    if job.kind == "prepare_task_plan" {
-        finish_plan_job(database_url, runner_id, &job, task_id, &output_content, thread_id.as_deref()).await
-    } else {
-        finish_execution_job(database_url, runner_id, &job, task_id, &output_content, thread_id.as_deref()).await
+    // 不同作业类型只在完成后的业务状态变化上分支，执行追踪语义保持一致。
+    match job.kind.as_str() {
+        "prepare_task_plan" => finish_plan_job(database_url, runner_id, &job, job.task_id.as_deref().expect("validated task id"), &output_content, thread_id.as_deref()).await,
+        "execute_task" => finish_execution_job(database_url, runner_id, &job, job.task_id.as_deref().expect("validated task id"), &output_content, thread_id.as_deref()).await,
+        "optimize_agent_profile" => finish_general_job(database_url, runner_id, &job, "responsibility_draft", &output_content, thread_id.as_deref()).await,
+        "summarize_conversation" => finish_conversation_summary(database_url, runner_id, &job, &output_content, thread_id.as_deref()).await,
+        _ => unreachable!("job kind was validated"),
     }
 }
 
-/// 查询任务和项目的最小提示上下文，不把执行控制字段交给 Codex。
-async fn load_task_context(database_url: &str, task_id: &str) -> Result<TaskContext, String> {
+/// 查询任务、项目、主责 Agent 和范围内记忆，不把执行控制字段交给 Codex。
+async fn load_task_context(database_url: &str, task_id: &str) -> Result<ExecutionContext, String> {
+    // 主责 Agent 优先，缺失时使用项目协调 Agent 作为执行上下文兜底。
     let client = connect(database_url).await?;
-    let row = client.query_opt("SELECT p.id, p.name, t.title, t.description FROM tasks t JOIN projects p ON p.id = t.project_id WHERE t.id = $1", &[&task_id]).await.map_err(|error| error.to_string())?.ok_or_else(|| "task not found".to_owned())?;
-    Ok(TaskContext { project_id: row.get(0), project_name: row.get(1), title: row.get(2), description: row.get(3) })
+    let row = client.query_opt("SELECT p.id, p.name, t.title, t.description, a.id, a.name, concat_ws(E'\n', a.instructions, NULLIF(a.responsibility_supplement, ''), NULLIF(pa.responsibility_override, '')) FROM tasks t JOIN projects p ON p.id = t.project_id JOIN project_agents coordinator ON coordinator.project_id = p.id AND coordinator.assignment_type = 'coordinator' AND coordinator.status = 'active' LEFT JOIN task_agents owner ON owner.task_id = t.id AND owner.participation_type = 'owner' AND owner.status = 'active' JOIN agents a ON a.id = COALESCE(owner.agent_id, coordinator.agent_id) LEFT JOIN project_agents pa ON pa.project_id = p.id AND pa.agent_id = a.id AND pa.status = 'active' WHERE t.id = $1", &[&task_id]).await.map_err(|error| error.to_string())?.ok_or_else(|| "task or active coordinator not found".to_owned())?;
+    let project_id = row.get::<_, String>(0);
+    let agent_id = row.get::<_, String>(4);
+
+    // 仅加载当前 Agent 的全局记忆和与当前项目、任务相符的记忆，限制数量防止提示无限膨胀。
+    let memories = load_memories(&client, &agent_id, Some(&project_id), Some(task_id)).await?;
+    Ok(ExecutionContext { project_id, project_name: row.get(1), title: row.get(2), description: row.get(3), agent_id: Some(agent_id), agent_name: row.get(5), agent_instructions: row.get(6), memories })
+}
+
+/// 从作业载荷构造职责优化上下文，已有 Agent 的职责与记忆会作为草案参考。
+async fn load_agent_profile_context(database_url: &str, job: &ClaimedJob) -> Result<ExecutionContext, String> {
+    // 用户输入必须在作业创建时完成校验，Runner 仍以空值保护处理异常历史数据。
+    let client = connect(database_url).await?;
+    let name = job.payload.get("name").and_then(serde_json::Value::as_str).unwrap_or("未命名 Agent").to_owned();
+    let description = job.payload.get("description").and_then(serde_json::Value::as_str).unwrap_or("").to_owned();
+    let supplement = job.payload.get("responsibility_supplement").and_then(serde_json::Value::as_str).unwrap_or("");
+    let mut instructions = supplement.to_owned();
+    let mut memories = "无相关记忆".to_owned();
+    if let Some(agent_id) = job.agent_id.as_ref() {
+        if let Some(row) = client.query_opt("SELECT concat_ws(E'\n', instructions, NULLIF(responsibility_supplement, '')) FROM agents WHERE id = $1", &[&agent_id]).await.map_err(|error| error.to_string())? {
+            instructions = row.get(0);
+            memories = load_memories(&client, agent_id, None, None).await?;
+        }
+    }
+    Ok(ExecutionContext { project_id: "00000000-0000-0000-0000-000000000000".to_owned(), project_name: "协序 Agent 身份中心".to_owned(), title: name.clone(), description, agent_id: job.agent_id.clone(), agent_name: name, agent_instructions: instructions, memories })
+}
+
+/// 将项目临时群聊整理为受控对话总结上下文。
+async fn load_conversation_context(database_url: &str, conversation_id: &str) -> Result<ExecutionContext, String> {
+    // 只允许加载属于项目且处于归档中的临时群聊。
+    let client = connect(database_url).await?;
+    let row = client.query_opt("SELECT p.id, p.name, c.title, a.id, a.name, concat_ws(E'\n', a.instructions, NULLIF(a.responsibility_supplement, ''), NULLIF(pa.responsibility_override, '')) FROM conversations c JOIN projects p ON p.id = c.project_id JOIN project_agents pa ON pa.project_id = p.id AND pa.assignment_type = 'coordinator' AND pa.status = 'active' JOIN agents a ON a.id = pa.agent_id WHERE c.id = $1 AND c.conversation_type = 'project_temporary' AND c.status = 'archiving'", &[&conversation_id]).await.map_err(|error| error.to_string())?.ok_or_else(|| "archiving project conversation not found".to_owned())?;
+    let project_id = row.get::<_, String>(0);
+    let agent_id = row.get::<_, String>(3);
+
+    // 消息按时间聚合并限制总长度，原始消息仍完整保存在数据库中。
+    let messages = client.query("SELECT author_type, author_id, content FROM conversation_messages WHERE conversation_id = $1 ORDER BY created_at, id", &[&conversation_id]).await.map_err(|error| error.to_string())?;
+    let transcript = messages.iter().map(|message| format!("[{}:{}] {}", message.get::<_, String>(0), message.get::<_, String>(1), message.get::<_, String>(2))).collect::<Vec<_>>().join("\n");
+    let description = transcript.chars().take(60_000).collect::<String>();
+    let memories = load_memories(&client, &agent_id, Some(&project_id), None).await?;
+    Ok(ExecutionContext { project_id, project_name: row.get(1), title: row.get(2), description, agent_id: Some(agent_id), agent_name: row.get(4), agent_instructions: row.get(5), memories })
+}
+
+/// 批量加载一个 Agent 在给定项目、任务范围内可用的最近记忆。
+async fn load_memories(client: &Client, agent_id: &str, project_id: Option<&String>, task_id: Option<&str>) -> Result<String, String> {
+    // 项目或任务记忆只能命中相同范围；无范围的长期经验可跨项目复用。
+    let rows = client.query("SELECT tier, content FROM agent_memories WHERE agent_id = $1 AND status = 'active' AND (project_id IS NULL OR project_id = $2) AND (task_id IS NULL OR task_id = $3) ORDER BY updated_at DESC LIMIT 20", &[&agent_id, &project_id, &task_id]).await.map_err(|error| error.to_string())?;
+    if rows.is_empty() { return Ok("无相关记忆".to_owned()); }
+    Ok(rows.iter().map(|row| format!("- [{}] {}", row.get::<_, String>(0), row.get::<_, String>(1))).collect::<Vec<_>>().join("\n"))
 }
 
 /// 在外部执行前提交 started 事件，长任务运行期间前端即可看到真实状态。
@@ -261,9 +377,50 @@ async fn finish_execution_job(database_url: &str, runner_id: &str, job: &Claimed
     transaction.commit().await.map_err(|error| error.to_string())
 }
 
+/// 完成不改变任务状态的通用 Agent 作业，例如职责草案。
+async fn finish_general_job(database_url: &str, runner_id: &str, job: &ClaimedJob, output_type: &str, output_content: &str, thread_id: Option<&str>) -> Result<(), String> {
+    // 通用作业只写执行事实和输出，不自动覆盖 Agent 配置。
+    let mut client = connect(database_url).await?;
+    let transaction = client.transaction().await.map_err(|error| error.to_string())?;
+    finish_general_records(&transaction, runner_id, job, output_type, output_content, thread_id).await?;
+    transaction.commit().await.map_err(|error| error.to_string())
+}
+
+/// 完成对话总结作业，将总结追加为系统消息并正式归档临时群聊。
+async fn finish_conversation_summary(database_url: &str, runner_id: &str, job: &ClaimedJob, output_content: &str, thread_id: Option<&str>) -> Result<(), String> {
+    // 对话必须仍处于 archiving，避免用户恢复或其他作业改变状态后写入过期总结。
+    let conversation_id = job.conversation_id.as_ref().ok_or_else(|| "conversation summary requires conversation_id".to_owned())?;
+    let mut client = connect(database_url).await?;
+    let transaction = client.transaction().await.map_err(|error| error.to_string())?;
+    let updated = transaction.execute("UPDATE conversations SET status = 'archived', archived_at = now(), updated_at = now() WHERE id = $1 AND status = 'archiving'", &[&conversation_id]).await.map_err(|error| error.to_string())?;
+    if updated != 1 {
+        drop(transaction);
+        return mark_failed(database_url, job, "conversation is no longer archiving").await;
+    }
+
+    // 总结以追加消息保存，原始对话顺序和内容不做修改。
+    transaction.execute("INSERT INTO conversation_messages (id, conversation_id, author_type, author_id, content, message_type) VALUES ($1, $2, 'system', 'runner', $3, 'summary')", &[&Uuid::new_v4().to_string(), &conversation_id, &output_content]).await.map_err(|error| error.to_string())?;
+    finish_general_records(&transaction, runner_id, job, "conversation_summary", output_content, thread_id).await?;
+    transaction.commit().await.map_err(|error| error.to_string())
+}
+
+/// 在调用方事务内保存通用作业输出、尝试状态和审计事件。
+async fn finish_general_records(transaction: &tokio_postgres::Transaction<'_>, runner_id: &str, job: &ClaimedJob, output_type: &str, output_content: &str, thread_id: Option<&str>) -> Result<(), String> {
+    // 输出携带全部可用业务作用域，后续页面无需解析 payload 才能定位来源。
+    transaction.execute("INSERT INTO run_outputs (id, job_id, task_id, project_id, agent_id, conversation_id, output_type, content) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)", &[&Uuid::new_v4().to_string(), &job.job_id, &job.task_id, &job.project_id, &job.agent_id, &job.conversation_id, &output_type, &output_content]).await.map_err(|error| error.to_string())?;
+    transaction.execute("INSERT INTO execution_events (job_id, attempt_id, task_id, project_id, agent_id, conversation_id, event_type, payload) VALUES ($1, $2, $3, $4, $5, $6, 'output.created', $7)", &[&job.job_id, &job.attempt_id, &job.task_id, &job.project_id, &job.agent_id, &job.conversation_id, &json!({ "output_type": output_type, "codex_thread_id": thread_id })]).await.map_err(|error| error.to_string())?;
+
+    // 尝试与作业在同一事务进入成功状态，避免输出可见但作业仍显示运行中。
+    transaction.execute("UPDATE execution_attempts SET status = 'succeeded', heartbeat_at = now(), finished_at = now(), codex_thread_id = $2 WHERE id = $1", &[&job.attempt_id, &thread_id]).await.map_err(|error| error.to_string())?;
+    transaction.execute("UPDATE execution_jobs SET status = 'succeeded', updated_at = now() WHERE id = $1", &[&job.job_id]).await.map_err(|error| error.to_string())?;
+    transaction.execute("INSERT INTO execution_events (job_id, attempt_id, task_id, project_id, agent_id, conversation_id, event_type, payload) VALUES ($1, $2, $3, $4, $5, $6, 'job.succeeded', $7)", &[&job.job_id, &job.attempt_id, &job.task_id, &job.project_id, &job.agent_id, &job.conversation_id, &json!({ "runner_id": runner_id, "kind": job.kind.clone(), "codex_thread_id": thread_id })]).await.map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 /// 在业务状态更新事务内统一写入输出、成功状态和审计事件。
 async fn finish_job_records(transaction: &tokio_postgres::Transaction<'_>, job: &ClaimedJob, task_id: &str, output_type: &str, output_content: &str, runner_id: &str, thread_id: Option<&str>) -> Result<(), String> {
-    transaction.execute("INSERT INTO run_outputs (id, job_id, task_id, output_type, content) VALUES ($1, $2, $3, $4, $5)", &[&Uuid::new_v4().to_string(), &job.job_id, &task_id, &output_type, &output_content]).await.map_err(|error| error.to_string())?;
+    // 任务输出同时带上项目和 Agent 作用域，便于后续运行记录和记忆提取使用。
+    transaction.execute("INSERT INTO run_outputs (id, job_id, task_id, project_id, agent_id, output_type, content) VALUES ($1, $2, $3, $4, $5, $6, $7)", &[&Uuid::new_v4().to_string(), &job.job_id, &task_id, &job.project_id, &job.agent_id, &output_type, &output_content]).await.map_err(|error| error.to_string())?;
     transaction.execute("INSERT INTO execution_events (job_id, attempt_id, task_id, event_type, payload) VALUES ($1, $2, $3, 'output.created', $4)", &[&job.job_id, &job.attempt_id, &job.task_id, &json!({ "output_type": output_type, "codex_thread_id": thread_id })]).await.map_err(|error| error.to_string())?;
     transaction.execute("UPDATE execution_attempts SET status = 'succeeded', heartbeat_at = now(), finished_at = now(), codex_thread_id = $2 WHERE id = $1", &[&job.attempt_id, &thread_id]).await.map_err(|error| error.to_string())?;
     transaction.execute("UPDATE execution_jobs SET status = 'succeeded', updated_at = now() WHERE id = $1", &[&job.job_id]).await.map_err(|error| error.to_string())?;
@@ -284,6 +441,13 @@ async fn mark_failed(database_url: &str, job: &ClaimedJob, message: &str) -> Res
         let task_status = if job_status == "failed" { "failed" } else { "queued" };
         transaction.execute("UPDATE tasks SET execution_status = $2, updated_at = now() WHERE id = $1 AND board_stage IN ('todo', 'in_progress')", &[task_id, &task_status]).await.map_err(|error| error.to_string())?;
     }
-    transaction.execute("INSERT INTO execution_events (job_id, attempt_id, task_id, event_type, payload) VALUES ($1, $2, $3, 'job.failed', $4)", &[&job.job_id, &job.attempt_id, &job.task_id, &json!({ "message": message })]).await.map_err(|error| error.to_string())?;
+
+    // 对话总结达到重试上限后恢复可编辑状态，避免永久停留在 archiving。
+    if job_status == "failed" {
+        if let Some(conversation_id) = job.conversation_id.as_ref() {
+            transaction.execute("UPDATE conversations SET status = 'active', updated_at = now() WHERE id = $1 AND status = 'archiving'", &[&conversation_id]).await.map_err(|error| error.to_string())?;
+        }
+    }
+    transaction.execute("INSERT INTO execution_events (job_id, attempt_id, task_id, project_id, agent_id, conversation_id, event_type, payload) VALUES ($1, $2, $3, $4, $5, $6, 'job.failed', $7)", &[&job.job_id, &job.attempt_id, &job.task_id, &job.project_id, &job.agent_id, &job.conversation_id, &json!({ "message": message })]).await.map_err(|error| error.to_string())?;
     transaction.commit().await.map_err(|error| error.to_string())
 }
